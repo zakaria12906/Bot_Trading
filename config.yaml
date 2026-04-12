@@ -1,0 +1,131 @@
+# ============================================================================
+# Fixed-Lot Grid Recovery Bot — Master Configuration
+# ============================================================================
+# This file controls every tunable parameter described in the blueprint.
+# All monetary values are in account currency unless stated otherwise.
+# ============================================================================
+
+general:
+  magic_number: 777001
+  comment_prefix: "GRID"
+  tick_interval_sec: 1          # main-loop sleep between ticks
+  cooldown_after_loss_sec: 300  # 5 min pause after a losing basket closes
+  max_concurrent_baskets: 1     # only 1 basket at a time (blueprint rule)
+
+# ---------------------------------------------------------------------------
+# Symbols — add one block per symbol you want to trade
+# ---------------------------------------------------------------------------
+symbols:
+  EURUSD:
+    enabled: true
+    lot_size: 0.01
+    max_trades: 6
+    basket_tp_currency: 5.0       # close basket when net P/L >= this
+    grid_step_multiplier: 1.5     # grid_step = ATR * this
+    min_step_points: 100          # floor for grid step in points
+    max_spread_points: 25
+    atr_period: 14
+    atr_timeframe: M15
+    higher_tf: H1
+    entry_tf: M15
+    higher_ma_period: 200
+    short_ma_period: 20
+    max_atr_ratio: 1.8            # block if current ATR > baseline * this
+    adx_period: 14
+    adx_ceiling: 30               # block entries when ADX above this
+    distance_from_mean_max: 2.5   # in ATR units — skip if already stretched
+    time_stop_minutes: 480        # 8 hours max basket lifespan
+    session_start: "08:00"        # server time
+    session_end: "20:00"
+    news_lockout_minutes: 30      # no new cycle within this of a high-impact event
+
+  XAUUSD:
+    enabled: true
+    lot_size: 0.01
+    max_trades: 5
+    basket_tp_currency: 8.0
+    grid_step_multiplier: 1.2
+    min_step_points: 300
+    max_spread_points: 50
+    atr_period: 14
+    atr_timeframe: M15
+    higher_tf: H1
+    entry_tf: M15
+    higher_ma_period: 200
+    short_ma_period: 20
+    max_atr_ratio: 1.6
+    adx_period: 14
+    adx_ceiling: 28
+    distance_from_mean_max: 2.0
+    time_stop_minutes: 360
+    session_start: "09:00"
+    session_end: "19:00"
+    news_lockout_minutes: 45
+
+  US30:
+    enabled: true
+    lot_size: 0.01
+    max_trades: 5
+    basket_tp_currency: 10.0
+    grid_step_multiplier: 1.0
+    min_step_points: 500
+    max_spread_points: 80
+    atr_period: 14
+    atr_timeframe: M15
+    higher_tf: H1
+    entry_tf: M15
+    higher_ma_period: 200
+    short_ma_period: 20
+    max_atr_ratio: 1.5
+    adx_period: 14
+    adx_ceiling: 30
+    distance_from_mean_max: 2.0
+    time_stop_minutes: 360
+    session_start: "15:30"
+    session_end: "21:30"
+    news_lockout_minutes: 30
+
+# ---------------------------------------------------------------------------
+# Risk management — two-mode system (Normal / Defensive / Shutdown)
+# ---------------------------------------------------------------------------
+risk:
+  equity_stop_pct: 3.0            # % of balance — hard kill
+  equity_warning_pct: 1.5         # % of balance — triggers defensive mode
+  max_daily_loss_pct: 5.0         # % of starting daily balance
+  max_daily_losing_baskets: 3     # stop for the day after N losing baskets
+  defensive_atr_ratio: 1.4        # ATR ratio that triggers defensive mode
+  shutdown_atr_ratio: 2.2         # ATR ratio that triggers full shutdown
+  defensive_adx: 28               # ADX above this → defensive
+  shutdown_adx: 40                # ADX above this → shutdown
+  spread_defensive_mult: 2.0      # spread > normal * this → defensive
+  spread_shutdown_mult: 4.0       # spread > normal * this → shutdown
+  breakout_candle_count: 3        # N consecutive impulse candles → breakout signal
+  breakout_range_mult: 1.8        # bar range > ATR * this → breakout candle
+
+# ---------------------------------------------------------------------------
+# News filter
+# ---------------------------------------------------------------------------
+news:
+  enabled: true
+  calendar_url: "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+  impact_levels:
+    - "High"
+  refresh_interval_sec: 3600      # re-fetch calendar every hour
+
+# ---------------------------------------------------------------------------
+# Webhook (TradingView integration)
+# ---------------------------------------------------------------------------
+webhook:
+  enabled: true
+  host: "0.0.0.0"
+  port: 5000
+  secret: ""                      # set via WEBHOOK_SECRET env var
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  level: "INFO"                   # DEBUG, INFO, WARNING, ERROR
+  file: "logs/grid_bot.log"
+  max_bytes: 10485760             # 10 MB
+  backup_count: 5
