@@ -1,14 +1,16 @@
 """MetaTrader 5 broker adapter.
 
 Wraps the MetaTrader5 Python package behind the BaseBroker interface so
-the rest of the bot never imports MT5 directly.
+the rest of the bot never imports MT5 directly.  Includes automatic
+reconnection and symbol_select handling.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from broker.base_broker import (
     Bar, BaseBroker, OrderResult, Position, SymbolInfo,
@@ -18,6 +20,8 @@ log = logging.getLogger("grid_bot.mt5")
 
 BUY = 0
 SELL = 1
+_MAX_RECONNECT_ATTEMPTS = 5
+_RECONNECT_DELAY_SEC = 3
 
 
 class MT5Connector(BaseBroker):
@@ -28,6 +32,7 @@ class MT5Connector(BaseBroker):
         self._server = server
         self._path = path
         self._mt5 = None
+        self._selected_symbols: Set[str] = set()
 
     # ------------------------------------------------------------------
     # Connection
@@ -59,6 +64,40 @@ class MT5Connector(BaseBroker):
         )
         return True
 
+    def _ensure_connected(self) -> bool:
+        """Check connection health; reconnect if needed."""
+        mt5 = self._mt5
+        if mt5 is None:
+            return False
+        info = mt5.account_info()
+        if info is not None:
+            return True
+
+        log.warning("MT5 connection lost -- attempting reconnect")
+        for attempt in range(1, _MAX_RECONNECT_ATTEMPTS + 1):
+            mt5.shutdown()
+            time.sleep(_RECONNECT_DELAY_SEC)
+            if self.connect():
+                log.info("Reconnected on attempt %d", attempt)
+                self._selected_symbols.clear()
+                return True
+            log.warning("Reconnect attempt %d failed", attempt)
+        log.critical("All reconnect attempts exhausted")
+        return False
+
+    def _ensure_symbol_selected(self, symbol: str) -> bool:
+        """MT5 requires symbol_select(symbol, True) before most operations."""
+        if symbol in self._selected_symbols:
+            return True
+        mt5 = self._mt5
+        if mt5 is None:
+            return False
+        if mt5.symbol_select(symbol, True):
+            self._selected_symbols.add(symbol)
+            return True
+        log.error("symbol_select(%s) failed: %s", symbol, mt5.last_error())
+        return False
+
     def shutdown(self) -> None:
         if self._mt5:
             self._mt5.shutdown()
@@ -68,6 +107,9 @@ class MT5Connector(BaseBroker):
     # Market data
     # ------------------------------------------------------------------
     def get_symbol_info(self, symbol: str) -> Optional[SymbolInfo]:
+        if not self._ensure_connected():
+            return None
+        self._ensure_symbol_selected(symbol)
         mt5 = self._mt5
         info = mt5.symbol_info(symbol)
         if info is None:
@@ -87,6 +129,9 @@ class MT5Connector(BaseBroker):
         )
 
     def get_bars(self, symbol: str, timeframe: int, count: int) -> List[Bar]:
+        if not self._ensure_connected():
+            return []
+        self._ensure_symbol_selected(symbol)
         rates = self._mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
         if rates is None or len(rates) == 0:
             return []
@@ -104,6 +149,9 @@ class MT5Connector(BaseBroker):
         return bars
 
     def get_tick(self, symbol: str) -> Optional[dict]:
+        if not self._ensure_connected():
+            return None
+        self._ensure_symbol_selected(symbol)
         tick = self._mt5.symbol_info_tick(symbol)
         if tick is None:
             return None
@@ -117,6 +165,9 @@ class MT5Connector(BaseBroker):
         sl: float = 0.0, tp: float = 0.0,
         magic: int = 0, comment: str = "",
     ) -> OrderResult:
+        if not self._ensure_connected():
+            return OrderResult(False, message="MT5 not connected")
+        self._ensure_symbol_selected(symbol)
         mt5 = self._mt5
         info = mt5.symbol_info(symbol)
         if info is None:
@@ -155,6 +206,8 @@ class MT5Connector(BaseBroker):
         return OrderResult(True, ticket=result.order)
 
     def close_position(self, ticket: int) -> OrderResult:
+        if not self._ensure_connected():
+            return OrderResult(False, message="MT5 not connected")
         mt5 = self._mt5
         pos = mt5.positions_get(ticket=ticket)
         if pos is None or len(pos) == 0:
@@ -192,6 +245,8 @@ class MT5Connector(BaseBroker):
     # Account / position queries
     # ------------------------------------------------------------------
     def get_positions(self, symbol: str, magic: int) -> List[Position]:
+        if not self._ensure_connected():
+            return []
         raw = self._mt5.positions_get(symbol=symbol)
         if raw is None:
             return []
@@ -216,9 +271,13 @@ class MT5Connector(BaseBroker):
         return positions
 
     def account_balance(self) -> float:
+        if not self._ensure_connected():
+            return 0.0
         info = self._mt5.account_info()
         return info.balance if info else 0.0
 
     def account_equity(self) -> float:
+        if not self._ensure_connected():
+            return 0.0
         info = self._mt5.account_info()
         return info.equity if info else 0.0

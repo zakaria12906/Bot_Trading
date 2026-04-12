@@ -26,6 +26,7 @@ class BreakoutSignals:
     adx_value: float = 0.0
     distance_from_mean: float = 0.0
     retest_failed: bool = False
+    time_under_water: bool = False
     score: int = 0          # how many independent signals are firing
 
 
@@ -35,6 +36,11 @@ class BreakoutDetector:
         self.broker = broker
         self.sym_cfg = sym_cfg
         self.risk_cfg = risk_cfg
+        self._minutes_under_water: float = 0.0
+
+    def set_time_under_water(self, minutes: float) -> None:
+        """Injected by the engine each tick so the detector can score it."""
+        self._minutes_under_water = minutes
 
     def evaluate(self, symbol: str) -> BreakoutSignals:
         tf = tf_to_mt5(self.sym_cfg.get("entry_tf", "M15"))
@@ -68,6 +74,10 @@ class BreakoutDetector:
             rejected = abs(curr_close - ma_val) > atr_val * 0.8
             retest_failed = approached and rejected
 
+        # Time-under-water: basket stuck in loss beyond half the time stop
+        time_stop = self.sym_cfg.get("time_stop_minutes", 480)
+        tuw = self._minutes_under_water > time_stop * 0.5
+
         score = 0
         if impulse_count >= self.risk_cfg.get("breakout_candle_count", 3):
             score += 1
@@ -77,12 +87,15 @@ class BreakoutDetector:
             score += 1
         if retest_failed:
             score += 1
+        if tuw:
+            score += 1
 
         sig = BreakoutSignals(
             impulse_count=impulse_count,
             adx_value=adx_val,
             distance_from_mean=dist,
             retest_failed=retest_failed,
+            time_under_water=tuw,
             score=score,
         )
 

@@ -1,4 +1,4 @@
-"""Two-mode risk controller: Normal → Defensive → Shutdown.
+"""Two-mode risk controller: Normal -> Defensive -> Shutdown.
 
 This is the single most important safety layer.  It aggregates signals from
 every filter and decides what the bot is *allowed* to do on each tick.
@@ -56,6 +56,7 @@ class RiskManager:
         self._daily_start_balance: float = broker.account_balance()
         self._daily_losing_baskets: int = 0
         self._last_daily_reset: str = ""
+        self._defensive_adds_used: int = 0
 
     # ------------------------------------------------------------------
     # Daily bookkeeping
@@ -72,51 +73,62 @@ class RiskManager:
         self._daily_losing_baskets += 1
         log.info("Losing baskets today: %d", self._daily_losing_baskets)
 
+    def reset_defensive_adds(self) -> None:
+        """Call when a new basket opens to reset the defensive-add counter."""
+        self._defensive_adds_used = 0
+
+    def consume_defensive_add(self) -> None:
+        self._defensive_adds_used += 1
+
     # ------------------------------------------------------------------
     # Mode evaluation
     # ------------------------------------------------------------------
     def evaluate_mode(self, symbol: str) -> RiskMode:
         """Compute the strictest risk mode across all dimensions."""
 
-        # 1 — Hard equity stop
+        # 1 - Hard equity stop
         if self._equity_stop_breached():
             return RiskMode.SHUTDOWN
 
-        # 2 — Daily loss limit
+        # 1b - Equity warning (softer threshold -> DEFENSIVE)
+        if self._equity_warning_breached():
+            return RiskMode.DEFENSIVE
+
+        # 2 - Daily loss limit
         if self._daily_loss_exceeded():
             return RiskMode.SHUTDOWN
 
-        # 3 — Daily losing basket cap
+        # 3 - Daily losing basket cap
         max_losers = self.risk_cfg.get("max_daily_losing_baskets", 3)
         if self._daily_losing_baskets >= max_losers:
             log.warning("Daily losing basket cap reached (%d)", max_losers)
             return RiskMode.SHUTDOWN
 
-        # 4 — Session window
+        # 4 - Session window
         if not self.session.is_in_session():
             return RiskMode.SHUTDOWN
 
-        # 5 — Spread explosion
+        # 5 - Spread explosion
         if self.spread.is_shutdown(symbol):
-            log.warning("%s spread explosion → SHUTDOWN", symbol)
+            log.warning("%s spread explosion -> SHUTDOWN", symbol)
             return RiskMode.SHUTDOWN
         if self.spread.is_defensive(symbol):
-            log.info("%s spread widened → DEFENSIVE", symbol)
+            log.info("%s spread widened -> DEFENSIVE", symbol)
             return RiskMode.DEFENSIVE
 
-        # 6 — News lockout
+        # 6 - News lockout
         lockout = self.sym_cfg.get("news_lockout_minutes", 30)
         if self.news.is_blocked(symbol, lockout):
             return RiskMode.DEFENSIVE
 
-        # 7 — Regime
+        # 7 - Regime
         regime_val = self.regime.evaluate(symbol)
         if regime_val == Regime.HOSTILE:
             return RiskMode.SHUTDOWN
         if regime_val == Regime.CAUTION:
             return RiskMode.DEFENSIVE
 
-        # 8 — Breakout
+        # 8 - Breakout
         bo = self.breakout.evaluate(symbol)
         if bo.score >= 3:
             return RiskMode.SHUTDOWN
@@ -140,15 +152,18 @@ class RiskManager:
         return True
 
     def can_add_grid_level(self, symbol: str) -> bool:
-        """Add-on allowed in NORMAL; one final controlled add in DEFENSIVE
-        only if spread is still acceptable."""
+        """Add-on allowed in NORMAL.  In DEFENSIVE, one final controlled add
+        is permitted if spread is still acceptable (blueprint rule)."""
         mode = self.evaluate_mode(symbol)
         if mode == RiskMode.SHUTDOWN:
             return False
-        if mode == RiskMode.DEFENSIVE:
-            return False
         if not self.spread.is_acceptable(symbol):
             return False
+        if mode == RiskMode.DEFENSIVE:
+            if self._defensive_adds_used >= 1:
+                return False
+            log.info("%s allowing one final defensive add", symbol)
+            return True
         return True
 
     def must_liquidate(self, symbol: str) -> bool:
@@ -167,6 +182,21 @@ class RiskManager:
         if loss > balance * pct / 100.0:
             log.critical(
                 "EQUITY STOP: loss %.2f > %.2f%% of balance %.2f",
+                loss, pct, balance,
+            )
+            return True
+        return False
+
+    def _equity_warning_breached(self) -> bool:
+        balance = self.broker.account_balance()
+        equity = self.broker.account_equity()
+        if balance == 0:
+            return False
+        pct = self.risk_cfg.get("equity_warning_pct", 1.5)
+        loss = balance - equity
+        if loss > balance * pct / 100.0:
+            log.warning(
+                "EQUITY WARNING: loss %.2f > %.2f%% of balance -> DEFENSIVE",
                 loss, pct, balance,
             )
             return True

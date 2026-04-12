@@ -97,6 +97,40 @@ class GridManager:
                 return lv
         return None
 
+    def recalculate_unfilled_levels(
+        self, plan: GridPlan, symbol: str, point: float,
+    ) -> None:
+        """Re-space unfilled levels using the current ATR.
+
+        Called before each add-on check so the grid widens when volatility
+        expands mid-cycle (blueprint requirement).
+        """
+        new_step = self.compute_step(symbol, point)
+        if new_step <= plan.step_points:
+            return  # only widen, never tighten
+
+        last_filled_price = plan.anchor_price
+        for lv in plan.levels:
+            if lv.filled:
+                last_filled_price = lv.target_price
+            else:
+                break
+
+        idx_offset = 1
+        for lv in plan.levels:
+            if lv.filled:
+                continue
+            if plan.direction == 0:
+                lv.target_price = last_filled_price - new_step * idx_offset
+            else:
+                lv.target_price = last_filled_price + new_step * idx_offset
+            idx_offset += 1
+
+        plan.step_points = new_step
+        log.info(
+            "%s grid widened mid-cycle: new step=%.5f", symbol, new_step,
+        )
+
     def should_fill_next(
         self, plan: GridPlan, current_price: float,
     ) -> GridLevel | None:

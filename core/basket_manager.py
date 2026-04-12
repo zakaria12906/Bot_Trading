@@ -108,6 +108,15 @@ class BasketManager:
             return True
         return False
 
+    def minutes_under_water(self) -> float:
+        """How long the basket has been in net loss (minutes since open).
+        Returns 0 if P/L is positive or no basket is active."""
+        if not self.active:
+            return 0.0
+        if self.basket_net_pnl() >= 0:
+            return 0.0
+        return (datetime.now(timezone.utc) - self.active.opened_at).total_seconds() / 60
+
     def check_scratch_exit(self, regime_deteriorated: bool) -> bool:
         """Priority 5 — close near breakeven if regime has deteriorated."""
         if not self.active or not regime_deteriorated:

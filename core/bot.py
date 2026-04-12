@@ -1,24 +1,24 @@
-"""Main bot orchestrator — the tick-by-tick decision engine.
+"""Main bot orchestrator -- the tick-by-tick decision engine.
 
 For each enabled symbol the bot runs one SymbolEngine instance.  Each engine
 manages at most one basket at a time and follows the blueprint's decision
 hierarchy on every tick:
 
     1. Reset daily counters if date changed
-    2. If SHUTDOWN → liquidate any open basket, stand down
-    3. If no basket open → check whether conditions allow a new cycle
-    4. If basket open → check exit hierarchy, then check grid level adds
+    2. If SHUTDOWN -> liquidate any open basket, stand down
+    3. If no basket open -> attempt orphan recovery, then check new cycle
+    4. If basket open -> check exit hierarchy, then check grid level adds
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
-from typing import Dict, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
 
-from broker.base_broker import BaseBroker
-from core.grid_manager import GridManager
+from broker.base_broker import BaseBroker, Position
+from core.grid_manager import GridManager, GridPlan, GridLevel
 from core.basket_manager import BasketManager
 from core.risk_manager import RiskManager, RiskMode
 from filters.regime_filter import RegimeFilter, Regime
@@ -53,6 +53,7 @@ class SymbolEngine:
         self.sym_cfg = sym_cfg
         self.risk_cfg = risk_cfg
         self.magic = magic
+        self.news_filter = news_filter
 
         # filters
         self.regime_filter = RegimeFilter(broker, sym_cfg)
@@ -72,6 +73,7 @@ class SymbolEngine:
 
         self._cooldown_until: Optional[datetime] = None
         self._spread_baselined = False
+        self._orphan_checked = False
 
     # ------------------------------------------------------------------
     # Main tick
@@ -92,16 +94,84 @@ class SymbolEngine:
             self._cooldown_until = None
             log.info("%s cooldown expired, resuming", self.symbol)
 
+        # On first tick, recover orphan positions from a previous session
+        if not self._orphan_checked:
+            self._orphan_checked = True
+            self._try_recover_orphans()
+
         if self.basket.has_active_basket:
             self._manage_open_basket()
         else:
             self._try_open_cycle()
 
     # ------------------------------------------------------------------
+    # Orphan position recovery (Gap E)
+    # ------------------------------------------------------------------
+    def _try_recover_orphans(self) -> None:
+        """If the bot restarts and finds open positions with our magic number,
+        rebuild a basket state so we can manage them instead of ignoring them."""
+        if self.basket.has_active_basket:
+            return
+        positions = self.broker.get_positions(self.symbol, self.magic)
+        if not positions:
+            return
+
+        direction = positions[0].type
+        if not all(p.type == direction for p in positions):
+            log.warning(
+                "%s orphan positions have mixed directions -- closing all",
+                self.symbol,
+            )
+            for p in positions:
+                self.broker.close_position(p.ticket)
+            return
+
+        info = self.broker.get_symbol_info(self.symbol)
+        point = info.point if info else 0.00001
+
+        # Sort by open time to reconstruct level order
+        positions.sort(key=lambda p: p.time)
+        anchor = positions[0].price_open
+        lot = positions[0].volume
+
+        # Build a synthetic grid plan matching the existing positions
+        max_trades = self.sym_cfg.get("max_trades", 6)
+        step = self.grid.compute_step(self.symbol, point)
+        levels: List[GridLevel] = []
+        for i in range(max_trades):
+            if direction == BUY:
+                target = anchor - step * i
+            else:
+                target = anchor + step * i
+            lv = GridLevel(index=i, target_price=target)
+            if i < len(positions):
+                lv.filled = True
+                lv.ticket = positions[i].ticket
+            levels.append(lv)
+
+        plan = GridPlan(
+            direction=direction,
+            lot_size=lot,
+            step_points=step,
+            levels=levels,
+            anchor_price=anchor,
+        )
+        self.basket.open_basket(self.symbol, direction, plan)
+        log.info(
+            "%s recovered %d orphan positions as basket (dir=%s)",
+            self.symbol, len(positions),
+            "BUY" if direction == BUY else "SELL",
+        )
+
+    # ------------------------------------------------------------------
     # Open-basket management
     # ------------------------------------------------------------------
     def _manage_open_basket(self) -> None:
         symbol = self.symbol
+
+        # Feed time-under-water to the breakout detector before evaluation
+        self.breakout_det.set_time_under_water(self.basket.minutes_under_water())
+
         mode = self.risk.evaluate_mode(symbol)
 
         # Priority 1+2: emergency / regime shutdown
@@ -109,6 +179,21 @@ class SymbolEngine:
             pnl = self.basket.close_basket("SHUTDOWN")
             self._post_close(pnl)
             return
+
+        # Depth-aware news handling (Gap G):
+        # If news is approaching and the basket is shallow (<=2 trades),
+        # flatten proactively instead of just freezing adds.
+        lockout = self.sym_cfg.get("news_lockout_minutes", 30)
+        if self.news_filter.is_blocked(symbol, lockout):
+            trade_count = self.basket.basket_trade_count()
+            if trade_count <= 2:
+                log.info(
+                    "%s shallow basket (%d trades) -- flattening before news",
+                    symbol, trade_count,
+                )
+                pnl = self.basket.close_basket("NEWS_FLATTEN")
+                self._post_close(pnl)
+                return
 
         # Priority 3: time stop
         if self.basket.check_time_stop():
@@ -129,17 +214,22 @@ class SymbolEngine:
             self._post_close(pnl)
             return
 
-        # Grid add-on check
-        if mode == RiskMode.NORMAL and self.risk.can_add_grid_level(symbol):
-            self._check_grid_add()
+        # Grid add-on check (allowed in NORMAL, one final add in DEFENSIVE)
+        if self.risk.can_add_grid_level(symbol):
+            self._check_grid_add(mode)
 
-    def _check_grid_add(self) -> None:
+    def _check_grid_add(self, current_mode: RiskMode = RiskMode.NORMAL) -> None:
         if not self.basket.active:
             return
         plan = self.basket.active.plan
         tick = self.broker.get_tick(self.symbol)
         if tick is None:
             return
+
+        # Re-space unfilled levels if volatility expanded mid-cycle
+        info = self.broker.get_symbol_info(self.symbol)
+        if info:
+            self.grid.recalculate_unfilled_levels(plan, self.symbol, info.point)
 
         price = tick["bid"] if plan.direction == BUY else tick["ask"]
         level = self.grid.should_fill_next(plan, price)
@@ -159,6 +249,9 @@ class SymbolEngine:
                 "%s grid level %d filled @ %.5f | ticket %d",
                 self.symbol, level.index, price, result.ticket,
             )
+            # Consume the one allowed add if we are in defensive mode
+            if current_mode == RiskMode.DEFENSIVE:
+                self.risk.consume_defensive_add()
 
     # ------------------------------------------------------------------
     # New cycle entry
@@ -200,6 +293,7 @@ class SymbolEngine:
         plan.levels[0].ticket = result.ticket
 
         self.basket.open_basket(symbol, direction, plan)
+        self.risk.reset_defensive_adds()
         log.info(
             "%s new cycle: %s @ %.5f | ticket %d",
             symbol, "BUY" if direction == BUY else "SELL",
@@ -231,11 +325,11 @@ class SymbolEngine:
 
         # Higher TF bias
         if last_close > higher_ma:
-            # Bullish context — enter BUY on pullback toward short MA
+            # Bullish context -- enter BUY on pullback toward short MA
             if last_close <= short_ma_val * 1.001:
                 return BUY
         else:
-            # Bearish context — enter SELL on pullback toward short MA
+            # Bearish context -- enter SELL on pullback toward short MA
             if last_close >= short_ma_val * 0.999:
                 return SELL
 
@@ -247,16 +341,17 @@ class SymbolEngine:
     def _post_close(self, pnl: float) -> None:
         if pnl < 0:
             self.risk.record_losing_basket()
-            cooldown = self.sym_cfg.get("cooldown_after_loss_sec",
-                                        self.risk_cfg.get("cooldown_after_loss_sec", 300))
-            from datetime import timedelta
+            cooldown = self.sym_cfg.get(
+                "cooldown_after_loss_sec",
+                self.risk_cfg.get("cooldown_after_loss_sec", 300),
+            )
             self._cooldown_until = datetime.now(timezone.utc) + timedelta(seconds=cooldown)
             log.info(
                 "%s cooling down for %ds after loss %.2f",
                 self.symbol, cooldown, pnl,
             )
         self.basket.clear()
-        self._spread_baselined = False  # re-baseline next session
+        self._spread_baselined = False
 
 
 # ======================================================================
@@ -302,7 +397,7 @@ class GridRecoveryBot:
         """Blocking main loop."""
         interval = self.cfg.get("general", {}).get("tick_interval_sec", 1)
         self._running = True
-        log.info("Bot started — %d symbol(s) active", len(self.engines))
+        log.info("Bot started -- %d symbol(s) active", len(self.engines))
 
         while self._running:
             for engine in self.engines.values():
@@ -313,7 +408,7 @@ class GridRecoveryBot:
             time.sleep(interval)
 
     def stop(self) -> None:
-        log.info("Stop requested — closing all baskets…")
+        log.info("Stop requested -- closing all baskets")
         self._running = False
         for engine in self.engines.values():
             if engine.basket.has_active_basket:
@@ -355,6 +450,7 @@ class GridRecoveryBot:
         plan.levels[0].filled = True
         plan.levels[0].ticket = result.ticket
         engine.basket.open_basket(symbol, dir_int, plan)
+        engine.risk.reset_defensive_adds()
 
         return {
             "status": "opened",
