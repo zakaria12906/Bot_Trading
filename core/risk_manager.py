@@ -57,6 +57,8 @@ class RiskManager:
         self._daily_losing_baskets: int = 0
         self._last_daily_reset: str = ""
         self._defensive_adds_used: int = 0
+        self._cached_mode: RiskMode | None = None
+        self._cache_tick_id: int = -1
 
     # ------------------------------------------------------------------
     # Daily bookkeeping
@@ -83,9 +85,22 @@ class RiskManager:
     # ------------------------------------------------------------------
     # Mode evaluation
     # ------------------------------------------------------------------
-    def evaluate_mode(self, symbol: str) -> RiskMode:
-        """Compute the strictest risk mode across all dimensions."""
+    def invalidate_cache(self) -> None:
+        """Call once per tick so repeated evaluate_mode() calls reuse the result."""
+        self._cache_tick_id += 1
+        self._cached_mode = None
 
+    def evaluate_mode(self, symbol: str) -> RiskMode:
+        """Compute the strictest risk mode across all dimensions.
+        Result is cached within the same tick (between invalidate_cache calls)."""
+        if self._cached_mode is not None:
+            return self._cached_mode
+
+        mode = self._compute_mode(symbol)
+        self._cached_mode = mode
+        return mode
+
+    def _compute_mode(self, symbol: str) -> RiskMode:
         # 1 - Hard equity stop
         if self._equity_stop_breached():
             return RiskMode.SHUTDOWN

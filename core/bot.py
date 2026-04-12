@@ -56,7 +56,7 @@ class SymbolEngine:
         self.news_filter = news_filter
 
         # filters
-        self.regime_filter = RegimeFilter(broker, sym_cfg)
+        self.regime_filter = RegimeFilter(broker, sym_cfg, risk_cfg)
         self.vol_filter = VolatilityFilter(broker, sym_cfg)
         self.spread_filter = SpreadFilter(broker, sym_cfg, risk_cfg)
         self.session_filter = SessionFilter(sym_cfg)
@@ -80,6 +80,7 @@ class SymbolEngine:
     # ------------------------------------------------------------------
     def tick(self) -> None:
         """Called once per loop iteration."""
+        self.risk.invalidate_cache()
         self.risk.reset_daily_if_needed()
 
         # Baseline spread once per session
@@ -304,6 +305,8 @@ class SymbolEngine:
         """Determine directional bias using higher-TF MA + short-TF pullback.
 
         Returns BUY, SELL, or None if conditions are not met.
+        The pullback tolerance is ATR-based so it adapts across forex,
+        metals, and indices automatically.
         """
         htf = tf_to_mt5(self.sym_cfg.get("higher_tf", "H1"))
         etf = tf_to_mt5(self.sym_cfg.get("entry_tf", "M15"))
@@ -323,14 +326,19 @@ class SymbolEngine:
         if higher_ma == 0 or short_ma_val == 0:
             return None
 
-        # Higher TF bias
+        # ATR-based pullback tolerance (0.3 ATR above/below short MA)
+        current_atr = self.vol_filter.current_atr(self.symbol)
+        if current_atr == 0:
+            return None
+        pullback_tolerance = current_atr * 0.3
+
         if last_close > higher_ma:
             # Bullish context -- enter BUY on pullback toward short MA
-            if last_close <= short_ma_val * 1.001:
+            if last_close <= short_ma_val + pullback_tolerance:
                 return BUY
         else:
             # Bearish context -- enter SELL on pullback toward short MA
-            if last_close >= short_ma_val * 0.999:
+            if last_close >= short_ma_val - pullback_tolerance:
                 return SELL
 
         return None
@@ -372,6 +380,9 @@ class GridRecoveryBot:
         general = cfg.get("general", {})
         base_magic = general.get("magic_number", 777001)
         risk_cfg = cfg.get("risk", {})
+        # Propagate general-level cooldown into risk_cfg so engines can find it
+        if "cooldown_after_loss_sec" not in risk_cfg:
+            risk_cfg["cooldown_after_loss_sec"] = general.get("cooldown_after_loss_sec", 300)
 
         for i, (sym, sym_cfg) in enumerate(cfg.get("symbols", {}).items()):
             if not sym_cfg.get("enabled", False):

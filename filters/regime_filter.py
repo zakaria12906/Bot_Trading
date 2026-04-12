@@ -28,9 +28,10 @@ class Regime(Enum):
 
 class RegimeFilter:
 
-    def __init__(self, broker: BaseBroker, sym_cfg: dict):
+    def __init__(self, broker: BaseBroker, sym_cfg: dict, risk_cfg: dict | None = None):
         self.broker = broker
         self.cfg = sym_cfg
+        self.risk_cfg = risk_cfg or {}
 
     def evaluate(self, symbol: str) -> Regime:
         """Run all sub-checks and return the worst regime among them."""
@@ -67,7 +68,9 @@ class RegimeFilter:
 
         ratio = current / baseline
         shutdown_ratio = self.cfg.get("shutdown_atr_ratio", 2.2)
-        defensive_ratio = self.cfg.get("max_atr_ratio", 1.8)
+        defensive_ratio = self.risk_cfg.get(
+            "defensive_atr_ratio", self.cfg.get("max_atr_ratio", 1.8),
+        )
 
         if ratio >= shutdown_ratio:
             log.warning("%s ATR ratio %.2f → HOSTILE", symbol, ratio)
@@ -85,7 +88,9 @@ class RegimeFilter:
 
         adx_val = adx(bars, period)
         shutdown_adx = self.cfg.get("shutdown_adx", 40)
-        ceiling = self.cfg.get("adx_ceiling", 30)
+        ceiling = self.risk_cfg.get(
+            "defensive_adx", self.cfg.get("adx_ceiling", 30),
+        )
 
         if adx_val >= shutdown_adx:
             log.warning("%s ADX %.1f → HOSTILE", symbol, adx_val)
