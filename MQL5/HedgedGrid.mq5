@@ -208,7 +208,7 @@ bool HasEnoughMargin(double lot)
    if(OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lot,
                        SymbolInfoDouble(_Symbol, SYMBOL_ASK), marginReq))
    {
-      if(marginReq > freeMargin * 0.5) return false;
+      if(marginReq > freeMargin * 0.9) return false;
    }
    return true;
 }
@@ -307,12 +307,12 @@ bool TryOpenNewBasket(double bid, double ask)
    double biasLot = NormalizeDouble(BaseLot * BiasMultiplier, 2);
    biasLot = MathMax(biasLot, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN));
 
-   if(!HasEnoughMargin(biasLot + BaseLot))
+   if(!HasEnoughMargin(biasLot))
    {
       static datetime lastWarn = 0;
       if(TimeCurrent() - lastWarn > 60)
       {
-         Print("MARGIN BLOCK: lot=", DoubleToString(biasLot + BaseLot, 2),
+         Print("MARGIN BLOCK: lot=", DoubleToString(biasLot, 2),
                " | Free=", DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2),
                " | Equity=", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2));
          lastWarn = TimeCurrent();
@@ -434,7 +434,7 @@ void AddLevel(int b, int recovDir, double bid, double ask)
    if(nextLv >= MaxLevels) return;
 
    double nextLot = GetLot(nextLv);
-   if(!HasEnoughMargin(nextLot + BaseLot)) return;
+   if(!HasEnoughMargin(nextLot)) return;
 
    if(g_baskets[b].recoveryDir == -1)
       g_baskets[b].recoveryDir = recovDir;
