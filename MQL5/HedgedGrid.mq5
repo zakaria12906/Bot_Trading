@@ -1,57 +1,60 @@
 //+------------------------------------------------------------------+
 //|                                                   HedgedGrid.mq5 |
-//|                  Hedged Grid Bot v3 — Adaptive Multi-Basket EA    |
+//|               Hedged Grid Bot v4 — Trend-Biased Multi-Basket      |
 //|                                                                    |
-//|  KEY UPGRADE over v2:                                              |
-//|  - ATR-based adaptive GridStep (auto-scales with volatility)      |
-//|  - 5 simultaneous baskets for maximum position density            |
-//|  - Per-basket gridStep frozen at creation (stable grid)           |
-//|  - Smarter risk: per-basket + total drawdown limits               |
-//|  - Targets: 30-80+ positions/day, matching live bot behavior      |
+//|  KEY CHANGES from v3:                                              |
+//|  1. TREND-BIASED OPENING: EMA detects trend, initial pair has     |
+//|     directional bias (bigger lot on trend side). Correct trend    |
+//|     = instant profit cycle. Wrong trend = normal grid recovery.   |
+//|  2. FIXED GridStep (no ATR) — simpler, proven on Gold             |
+//|  3. 3 baskets × 7 levels — more activity, controlled risk        |
+//|  4. Lower BasketTP ($5) for faster cycling                        |
+//|  5. Margin guard + drawdown safety                                |
 //+------------------------------------------------------------------+
 
-#property copyright "Hedged Grid Bot v3"
-#property version   "3.00"
+#property copyright "Hedged Grid Bot v4"
+#property version   "4.00"
 #property strict
 
 #include <Trade\Trade.mqh>
 
 //+------------------------------------------------------------------+
-//| INPUT PARAMETERS                                                  |
+//| INPUTS                                                            |
 //+------------------------------------------------------------------+
 
 // ── Lot sizing ──
-input double   BaseLot          = 0.01;    // Base lot size
-input int      MaxLevels        = 7;       // Grid depth per basket (7 = lots up to 0.11)
+input double   BaseLot          = 0.01;    // Base lot (hedge side)
+input double   BiasMultiplier   = 2.0;     // Trend lot = BaseLot × this (e.g. 0.02)
+input int      MaxLevels        = 7;       // Grid depth (lots up to 0.11)
 
 // ── Grid spacing ──
-input bool     UseATR           = true;    // Use ATR for dynamic grid step
-input int      ATR_Period       = 14;      // ATR calculation period
-input ENUM_TIMEFRAMES ATR_TF   = PERIOD_H1;// ATR timeframe
-input double   ATR_GridMult     = 0.35;    // GridStep = ATR × this (when UseATR=true)
-input double   ATR_DistMult     = 0.60;    // MinDistance = ATR × this (when UseATR=true)
-input double   GridStep         = 4.0;     // Fixed grid step (when UseATR=false)
-input double   MinDistance      = 7.0;     // Fixed min distance (when UseATR=false)
+input double   GridStep         = 3.5;     // Points between grid levels
+input double   MinDistance      = 5.0;     // Min points between basket entries
 
-// ── Basket profit target ──
-input double   BasketTP         = 6.0;     // Close basket when net P/L >= this ($)
+// ── Take profit ──
+input double   BasketTP         = 5.0;     // Close basket when net P/L >= this ($)
 
 // ── Multi-basket ──
-input int      MaxBaskets       = 2;       // Max simultaneous baskets (2 safe for $1K)
+input int      MaxBaskets       = 3;       // Simultaneous baskets
 input int      BaseMagic        = 888000;  // Base magic number
 
-// ── Session ──
-input int      SessionStart     = 1;       // Session start hour (server time)
-input int      SessionEnd       = 23;      // Session end hour (server time)
+// ── Trend detection (EMA) ──
+input int      EMA_Fast         = 10;      // Fast EMA period
+input int      EMA_Slow         = 30;      // Slow EMA period
+input ENUM_TIMEFRAMES EMA_TF   = PERIOD_M15; // EMA timeframe
 
-// ── Risk management ──
-input double   MaxDrawdown      = 250.0;   // Emergency close ONE basket if loss > this ($)
-input double   MaxTotalDrawdown = 400.0;   // Emergency close ALL if total loss > this ($)
-input double   MinMarginPct     = 25.0;    // Stop opening if free margin < this % of equity
-input bool     CloseEndOfDay    = false;   // Force close all at SessionEnd
+// ── Session ──
+input int      SessionStart     = 1;       // Start hour (server time)
+input int      SessionEnd       = 23;      // End hour (server time)
+
+// ── Risk ──
+input double   MaxDrawdown      = 200.0;   // Emergency close ONE basket ($)
+input double   MaxTotalDrawdown = 350.0;   // Emergency close ALL baskets ($)
+input double   MinMarginPct     = 25.0;    // Stop if free margin < this %
+input bool     CloseEndOfDay    = false;   // Force close at session end
 
 // ── Execution ──
-input int      Slippage         = 30;      // Max slippage in points
+input int      Slippage         = 30;      // Max slippage points
 
 //+------------------------------------------------------------------+
 //| BASKET STATE                                                      |
@@ -61,10 +64,10 @@ struct SBasket
    int      magic;
    int      currentLevel;
    int      recoveryDir;      // -1=none, 0=BUY, 1=SELL
+   int      trendBias;        // 0=BUY bias, 1=SELL bias, -1=neutral
    double   lastBuyPrice;
    double   lastSellPrice;
    double   entryMid;
-   double   gridStep;         // frozen at basket creation from ATR
    bool     active;
    int      posCount;
    datetime openTime;
@@ -76,7 +79,8 @@ struct SBasket
 CTrade   trade;
 double   LotSeq[9];
 SBasket  g_baskets[];
-int      g_atrHandle = INVALID_HANDLE;
+int      g_emaFastH = INVALID_HANDLE;
+int      g_emaSlowH = INVALID_HANDLE;
 int      g_totalCycles  = 0;
 double   g_totalProfit  = 0.0;
 int      g_totalTrades  = 0;
@@ -90,7 +94,7 @@ int OnInit()
    trade.SetDeviationInPoints(Slippage);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
 
-   // Build lot sequence
+   // Lot sequence
    double mults[9] = {1, 1, 2, 3, 5, 7, 11, 17, 25};
    for(int i = 0; i < 9; i++)
    {
@@ -98,17 +102,14 @@ int OnInit()
       LotSeq[i] = MathMax(LotSeq[i], SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN));
    }
 
-   // ATR indicator handle
-   if(UseATR)
-   {
-      g_atrHandle = iATR(_Symbol, ATR_TF, ATR_Period);
-      if(g_atrHandle == INVALID_HANDLE)
-      {
-         Print("WARNING: ATR handle failed — falling back to fixed GridStep");
-      }
-   }
+   // EMA indicators
+   g_emaFastH = iMA(_Symbol, EMA_TF, EMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
+   g_emaSlowH = iMA(_Symbol, EMA_TF, EMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
 
-   // Initialize baskets
+   if(g_emaFastH == INVALID_HANDLE || g_emaSlowH == INVALID_HANDLE)
+      Print("WARNING: EMA handles failed — opening without bias");
+
+   // Baskets
    ArrayResize(g_baskets, MaxBaskets);
    for(int b = 0; b < MaxBaskets; b++)
    {
@@ -121,23 +122,18 @@ int OnInit()
    // Log
    string lots = "";
    for(int i = 0; i < MathMin(MaxLevels, 9); i++)
-   {
-      if(i > 0) lots += ",";
-      lots += DoubleToString(LotSeq[i], 2);
-   }
+   { if(i > 0) lots += ","; lots += DoubleToString(LotSeq[i], 2); }
 
-   Print("=== HEDGED GRID v3 — ADAPTIVE ===");
-   Print(_Symbol, " | ATR: ", UseATR ? "ON" : "OFF",
-         " | Baskets: ", MaxBaskets, " | TP: $", BasketTP);
-   Print("Lots: [", lots, "] | Levels: ", MaxLevels);
-   Print("Session: ", SessionStart, "-", SessionEnd,
-         " | DD/basket: $", MaxDrawdown, " | DD/total: $", MaxTotalDrawdown);
-
-   if(UseATR)
-      Print("ATR(", ATR_Period, ",", EnumToString(ATR_TF),
-            ") × ", ATR_GridMult, " = GridStep | × ", ATR_DistMult, " = MinDist");
-   else
-      Print("Fixed GridStep: ", GridStep, " | Fixed MinDist: ", MinDistance);
+   double biasLot = NormalizeDouble(BaseLot * BiasMultiplier, 2);
+   Print("=== HEDGED GRID v4 — TREND BIASED ===");
+   Print(_Symbol, " | Step: ", GridStep, " | TP: $", BasketTP,
+         " | Baskets: ", MaxBaskets);
+   Print("Base: ", DoubleToString(BaseLot, 2),
+         " | Bias lot: ", DoubleToString(biasLot, 2),
+         " (×", DoubleToString(BiasMultiplier, 1), ")");
+   Print("EMA(", EMA_Fast, "/", EMA_Slow, " on ", EnumToString(EMA_TF), ")");
+   Print("Recovery lots: [", lots, "] | Levels: ", MaxLevels);
+   Print("DD: $", MaxDrawdown, "/basket | $", MaxTotalDrawdown, "/total");
 
    int active = CountActive();
    if(active > 0) Print("Recovered ", active, " active baskets");
@@ -153,29 +149,41 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(g_atrHandle != INVALID_HANDLE)
-      IndicatorRelease(g_atrHandle);
+   if(g_emaFastH != INVALID_HANDLE) IndicatorRelease(g_emaFastH);
+   if(g_emaSlowH != INVALID_HANDLE) IndicatorRelease(g_emaSlowH);
 
-   Print("=== HEDGED GRID v3 STOPPED ===");
-   Print("Cycles: ", g_totalCycles, " | Profit: $",
-         DoubleToString(g_totalProfit, 2), " | Trades: ", g_totalTrades);
+   Print("=== v4 STOPPED | Cycles: ", g_totalCycles,
+         " | P/L: $", DoubleToString(g_totalProfit, 2),
+         " | Trades: ", g_totalTrades, " ===");
 }
 
 //+------------------------------------------------------------------+
-//| Get current ATR value                                             |
+//| Detect trend bias: 0=BUY, 1=SELL, -1=neutral                    |
 //+------------------------------------------------------------------+
-double GetATR()
+int DetectTrend()
 {
-   if(g_atrHandle == INVALID_HANDLE) return 0;
+   if(g_emaFastH == INVALID_HANDLE || g_emaSlowH == INVALID_HANDLE)
+      return -1;
 
-   double buf[1];
-   if(CopyBuffer(g_atrHandle, 0, 0, 1, buf) > 0)
-      return buf[0];
-   return 0;
+   double fast[2], slow[2];
+   if(CopyBuffer(g_emaFastH, 0, 0, 2, fast) < 2) return -1;
+   if(CopyBuffer(g_emaSlowH, 0, 0, 2, slow) < 2) return -1;
+
+   // Current: fast vs slow
+   double diff = fast[1] - slow[1];
+   // Trend strength: how fast the EMA gap is changing
+   double prevDiff = fast[0] - slow[0];
+   double momentum = diff - prevDiff;
+
+   // Require both crossover AND momentum confirmation
+   if(diff > 0 && momentum >= 0) return 0;  // BUY trend
+   if(diff < 0 && momentum <= 0) return 1;  // SELL trend
+
+   return -1;  // neutral / conflicting
 }
 
 //+------------------------------------------------------------------+
-//| Check if we have enough free margin to open a position            |
+//| Margin guard                                                      |
 //+------------------------------------------------------------------+
 bool HasEnoughMargin(double lot)
 {
@@ -183,62 +191,19 @@ bool HasEnoughMargin(double lot)
    double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
 
    if(equity <= 0) return false;
+   if((freeMargin / equity) * 100.0 < MinMarginPct) return false;
 
-   double freePct = (freeMargin / equity) * 100.0;
-   if(freePct < MinMarginPct)
+   double marginReq = 0;
+   if(OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lot,
+                       SymbolInfoDouble(_Symbol, SYMBOL_ASK), marginReq))
    {
-      static datetime lastWarn = 0;
-      if(TimeCurrent() - lastWarn > 60)
-      {
-         Print("MARGIN GUARD: free margin ", DoubleToString(freePct, 1),
-               "% < ", DoubleToString(MinMarginPct, 1), "% — skipping open");
-         lastWarn = TimeCurrent();
-      }
-      return false;
+      if(marginReq > freeMargin * 0.5) return false;
    }
-
-   // Also check if broker would accept this trade
-   double marginRequired = 0;
-   if(!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lot,
-                        SymbolInfoDouble(_Symbol, SYMBOL_ASK), marginRequired))
-      return true;  // Can't calculate, let broker decide
-
-   if(marginRequired > freeMargin * 0.5)
-      return false;
-
    return true;
 }
 
 //+------------------------------------------------------------------+
-//| Get effective grid step (ATR-based or fixed)                      |
-//+------------------------------------------------------------------+
-double GetEffectiveGridStep()
-{
-   if(UseATR)
-   {
-      double atr = GetATR();
-      if(atr > 0)
-         return NormalizeDouble(atr * ATR_GridMult, _Digits);
-   }
-   return GridStep;
-}
-
-//+------------------------------------------------------------------+
-//| Get effective min distance between baskets                        |
-//+------------------------------------------------------------------+
-double GetEffectiveMinDist()
-{
-   if(UseATR)
-   {
-      double atr = GetATR();
-      if(atr > 0)
-         return NormalizeDouble(atr * ATR_DistMult, _Digits);
-   }
-   return MinDistance;
-}
-
-//+------------------------------------------------------------------+
-//| OnTick — Main loop                                                |
+//| OnTick                                                            |
 //+------------------------------------------------------------------+
 void OnTick()
 {
@@ -250,7 +215,7 @@ void OnTick()
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    if(bid == 0 || ask == 0) return;
 
-   // ── GLOBAL SAFETY ──
+   // Global drawdown safety
    if(MaxTotalDrawdown > 0)
    {
       double totalPnL = GetTotalPnL();
@@ -262,45 +227,43 @@ void OnTick()
       }
    }
 
-   // ── SESSION END ──
+   // Session end close
    if(CloseEndOfDay && !inSession && CountActive() > 0)
-   {
-      CloseAllBaskets("SESSION_END");
-      return;
-   }
+   { CloseAllBaskets("SESSION_END"); return; }
 
-   // ── PROCESS EACH BASKET ──
+   // Process each active basket
    for(int b = 0; b < MaxBaskets; b++)
    {
       if(!g_baskets[b].active) continue;
 
       double pnl = GetBasketPnL(g_baskets[b].magic);
 
-      // Take profit → close + immediately recycle slot
+      // Take profit
       if(pnl >= BasketTP)
       {
-         int nClosed = CloseBasketPositions(g_baskets[b].magic);
+         int nc = CloseBasketPositions(g_baskets[b].magic);
          g_totalCycles++;
          g_totalProfit += pnl;
-         g_totalTrades += nClosed;
+         g_totalTrades += nc;
 
+         string dir = g_baskets[b].trendBias == 0 ? "BULL" :
+                      g_baskets[b].trendBias == 1 ? "BEAR" : "NEUT";
          Print("B#", b, " TP | Lv", g_baskets[b].currentLevel,
-               " | ", nClosed, " pos | $", DoubleToString(pnl, 2),
-               " | Cycle #", g_totalCycles,
-               " | Total: $", DoubleToString(g_totalProfit, 2));
+               " ", dir, " | ", nc, " pos | $", DoubleToString(pnl, 2),
+               " | #", g_totalCycles,
+               " | Tot: $", DoubleToString(g_totalProfit, 2));
 
          ResetBasket(b);
          continue;
       }
 
-      // Per-basket drawdown stop
+      // Per-basket drawdown
       if(MaxDrawdown > 0 && pnl <= -MaxDrawdown)
       {
-         int nClosed = CloseBasketPositions(g_baskets[b].magic);
+         int nc = CloseBasketPositions(g_baskets[b].magic);
          g_totalCycles++;
          g_totalProfit += pnl;
-         g_totalTrades += nClosed;
-
+         g_totalTrades += nc;
          Print("B#", b, " DD STOP | $", DoubleToString(pnl, 2));
          ResetBasket(b);
          continue;
@@ -311,14 +274,13 @@ void OnTick()
          CheckNextLevel(b, bid, ask);
    }
 
-   // ── OPEN NEW BASKETS ──
+   // Open new baskets if slots available
    if(inSession)
    {
       int active = CountActive();
       while(active < MaxBaskets)
       {
-         if(!TryOpenNewBasket(bid, ask))
-            break;
+         if(!TryOpenNewBasket(bid, ask)) break;
          active++;
       }
    }
@@ -331,18 +293,19 @@ void OnTick()
 //+------------------------------------------------------------------+
 bool TryOpenNewBasket(double bid, double ask)
 {
-   // Margin guard — don't open if not enough free margin
-   if(!HasEnoughMargin(BaseLot))
+   double biasLot = NormalizeDouble(BaseLot * BiasMultiplier, 2);
+   biasLot = MathMax(biasLot, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN));
+
+   if(!HasEnoughMargin(biasLot + BaseLot))
       return false;
 
    double mid = (bid + ask) / 2.0;
-   double minDist = GetEffectiveMinDist();
 
-   // Check distance from all active baskets
+   // Distance check from existing baskets
    for(int b = 0; b < MaxBaskets; b++)
    {
       if(!g_baskets[b].active) continue;
-      if(MathAbs(mid - g_baskets[b].entryMid) < minDist)
+      if(MathAbs(mid - g_baskets[b].entryMid) < MinDistance)
          return false;
    }
 
@@ -359,21 +322,34 @@ bool TryOpenNewBasket(double bid, double ask)
 }
 
 //+------------------------------------------------------------------+
-//| Open a new basket                                                 |
+//| Open basket with TREND BIAS                                       |
 //+------------------------------------------------------------------+
 void OpenBasket(int b, double bid, double ask)
 {
+   int trend = DetectTrend();  // 0=BUY, 1=SELL, -1=neutral
+
+   double biasLot = NormalizeDouble(BaseLot * BiasMultiplier, 2);
+   biasLot = MathMax(biasLot, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN));
+
+   // Determine lots based on trend
+   double buyLot, sellLot;
+   if(trend == 0)       { buyLot = biasLot; sellLot = BaseLot; }   // Bullish
+   else if(trend == 1)  { buyLot = BaseLot; sellLot = biasLot; }   // Bearish
+   else                 { buyLot = BaseLot; sellLot = BaseLot; }   // Neutral
+
    int magic = g_baskets[b].magic;
    trade.SetExpertMagicNumber(magic);
 
-   if(!trade.Buy(BaseLot, _Symbol, ask, 0, 0,
+   // BUY
+   if(!trade.Buy(buyLot, _Symbol, ask, 0, 0,
                   "HG_B" + IntegerToString(b) + "_L0_BUY"))
    {
       Print("B#", b, " BUY failed: ", trade.ResultRetcodeDescription());
       return;
    }
 
-   if(!trade.Sell(BaseLot, _Symbol, bid, 0, 0,
+   // SELL
+   if(!trade.Sell(sellLot, _Symbol, bid, 0, 0,
                    "HG_B" + IntegerToString(b) + "_L0_SELL"))
    {
       Print("B#", b, " SELL failed — closing BUY");
@@ -381,66 +357,59 @@ void OpenBasket(int b, double bid, double ask)
       return;
    }
 
-   // Freeze current ATR-based grid step for this basket's lifetime
-   double step = GetEffectiveGridStep();
-
    g_baskets[b].currentLevel  = 0;
    g_baskets[b].recoveryDir   = -1;
+   g_baskets[b].trendBias     = trend;
    g_baskets[b].lastBuyPrice  = ask;
    g_baskets[b].lastSellPrice = bid;
    g_baskets[b].entryMid      = (bid + ask) / 2.0;
-   g_baskets[b].gridStep      = step;
    g_baskets[b].active        = true;
    g_baskets[b].posCount      = 2;
    g_baskets[b].openTime      = TimeCurrent();
 
-   Print("B#", b, " OPENED @ ", DoubleToString((bid+ask)/2.0, _Digits),
-         " | step=", DoubleToString(step, 2),
+   string dir = trend == 0 ? "BULL" : trend == 1 ? "BEAR" : "NEUT";
+   Print("B#", b, " OPENED [", dir, "] BUY=",
+         DoubleToString(buyLot, 2), " SELL=",
+         DoubleToString(sellLot, 2),
+         " @ ", DoubleToString((bid+ask)/2.0, _Digits),
          " | Active: ", CountActive());
 }
 
 //+------------------------------------------------------------------+
-//| Check if next grid level should trigger                           |
+//| Check next grid level                                             |
 //+------------------------------------------------------------------+
 void CheckNextLevel(int b, double bid, double ask)
 {
-   double step        = g_baskets[b].gridStep;
-   double buyTrigger  = g_baskets[b].lastBuyPrice  - step;
-   double sellTrigger = g_baskets[b].lastSellPrice + step;
-   int    recDir      = g_baskets[b].recoveryDir;
+   double buyTrig  = g_baskets[b].lastBuyPrice  - GridStep;
+   double sellTrig = g_baskets[b].lastSellPrice + GridStep;
+   int    recDir   = g_baskets[b].recoveryDir;
 
    if(recDir == -1)
    {
-      if(bid <= buyTrigger && ask >= sellTrigger)
+      if(bid <= buyTrig && ask >= sellTrig)
       {
          if((g_baskets[b].lastBuyPrice - bid) >= (ask - g_baskets[b].lastSellPrice))
-            AddLevel(b, 0, bid, ask);  // BUY recovery
+            AddLevel(b, 0, bid, ask);
          else
-            AddLevel(b, 1, bid, ask);  // SELL recovery
+            AddLevel(b, 1, bid, ask);
       }
-      else if(bid <= buyTrigger)
-         AddLevel(b, 0, bid, ask);
-      else if(ask >= sellTrigger)
-         AddLevel(b, 1, bid, ask);
+      else if(bid <= buyTrig)  AddLevel(b, 0, bid, ask);
+      else if(ask >= sellTrig) AddLevel(b, 1, bid, ask);
    }
-   else if(recDir == 0 && bid <= buyTrigger)
-      AddLevel(b, 0, bid, ask);
-   else if(recDir == 1 && ask >= sellTrigger)
-      AddLevel(b, 1, bid, ask);
+   else if(recDir == 0 && bid <= buyTrig)  AddLevel(b, 0, bid, ask);
+   else if(recDir == 1 && ask >= sellTrig) AddLevel(b, 1, bid, ask);
 }
 
 //+------------------------------------------------------------------+
-//| Add a grid level (direction: 0=BUY recovery, 1=SELL recovery)    |
+//| Add grid level                                                    |
 //+------------------------------------------------------------------+
 void AddLevel(int b, int recovDir, double bid, double ask)
 {
    int nextLv = g_baskets[b].currentLevel + 1;
    if(nextLv >= MaxLevels) return;
 
-   // Margin guard before adding more positions
    double nextLot = GetLot(nextLv);
-   if(!HasEnoughMargin(nextLot + BaseLot))
-      return;
+   if(!HasEnoughMargin(nextLot + BaseLot)) return;
 
    if(g_baskets[b].recoveryDir == -1)
       g_baskets[b].recoveryDir = recovDir;
@@ -448,30 +417,27 @@ void AddLevel(int b, int recovDir, double bid, double ask)
    int magic = g_baskets[b].magic;
    trade.SetExpertMagicNumber(magic);
 
-   double recLot   = (g_baskets[b].recoveryDir == recovDir) ? GetLot(nextLv) : BaseLot;
-   double hedgeLot = BaseLot;
+   double recLot = (g_baskets[b].recoveryDir == recovDir) ? nextLot : BaseLot;
    string tag = "HG_B" + IntegerToString(b) + "_L" + IntegerToString(nextLv);
 
    if(recovDir == 0)
    {
-      // BUY recovery (price dropping)
       if(!trade.Buy(recLot, _Symbol, ask, 0, 0, tag + "_BUY"))
       { Print("B#", b, " L", nextLv, " BUY fail"); return; }
       g_baskets[b].lastBuyPrice = ask;
       g_baskets[b].posCount++;
 
-      if(trade.Sell(hedgeLot, _Symbol, bid, 0, 0, tag + "_SELL"))
+      if(trade.Sell(BaseLot, _Symbol, bid, 0, 0, tag + "_SELL"))
       { g_baskets[b].lastSellPrice = bid; g_baskets[b].posCount++; }
    }
    else
    {
-      // SELL recovery (price rising)
       if(!trade.Sell(recLot, _Symbol, bid, 0, 0, tag + "_SELL"))
       { Print("B#", b, " L", nextLv, " SELL fail"); return; }
       g_baskets[b].lastSellPrice = bid;
       g_baskets[b].posCount++;
 
-      if(trade.Buy(hedgeLot, _Symbol, ask, 0, 0, tag + "_BUY"))
+      if(trade.Buy(BaseLot, _Symbol, ask, 0, 0, tag + "_BUY"))
       { g_baskets[b].lastBuyPrice = ask; g_baskets[b].posCount++; }
    }
 
@@ -479,22 +445,20 @@ void AddLevel(int b, int recovDir, double bid, double ask)
 
    string dir = recovDir == 0 ? "BUY" : "SELL";
    Print("B#", b, " Lv", nextLv, " ", dir, " rec | ",
-         DoubleToString(recLot, 2), "+", DoubleToString(hedgeLot, 2),
+         DoubleToString(recLot, 2), "+", DoubleToString(BaseLot, 2),
          " | $", DoubleToString(GetBasketPnL(magic), 2));
 }
 
 //+------------------------------------------------------------------+
-//| Get lot from sequence (clamped to broker limits)                  |
+//| Get lot from sequence                                             |
 //+------------------------------------------------------------------+
 double GetLot(int level)
 {
    if(level < 0 || level >= 9) return BaseLot;
-
    double lot     = LotSeq[level];
    double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-
    lot = MathMax(lot, minLot);
    lot = MathMin(lot, maxLot);
    lot = MathFloor(lot / lotStep) * lotStep;
@@ -502,7 +466,7 @@ double GetLot(int level)
 }
 
 //+------------------------------------------------------------------+
-//| P/L calculation for one basket                                    |
+//| P/L for one basket                                                |
 //+------------------------------------------------------------------+
 double GetBasketPnL(int magic)
 {
@@ -514,7 +478,6 @@ double GetBasketPnL(int magic)
       if(ticket == 0) continue;
       if(PositionGetInteger(POSITION_MAGIC) != magic) continue;
       if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-
       total += PositionGetDouble(POSITION_PROFIT)
              + PositionGetDouble(POSITION_SWAP)
              + PositionGetDouble(POSITION_COMMISSION);
@@ -523,15 +486,14 @@ double GetBasketPnL(int magic)
 }
 
 //+------------------------------------------------------------------+
-//| Total P/L across all baskets                                      |
+//| Total P/L all baskets                                             |
 //+------------------------------------------------------------------+
 double GetTotalPnL()
 {
-   double total = 0;
+   double t = 0;
    for(int b = 0; b < MaxBaskets; b++)
-      if(g_baskets[b].active)
-         total += GetBasketPnL(g_baskets[b].magic);
-   return total;
+      if(g_baskets[b].active) t += GetBasketPnL(g_baskets[b].magic);
+   return t;
 }
 
 //+------------------------------------------------------------------+
@@ -546,13 +508,12 @@ int CountActive()
 }
 
 //+------------------------------------------------------------------+
-//| Count positions for a magic number                                |
+//| Count positions for magic                                         |
 //+------------------------------------------------------------------+
 int CountPositions(int magic)
 {
-   int c = 0;
-   int total = PositionsTotal();
-   for(int i = 0; i < total; i++)
+   int c = 0, t = PositionsTotal();
+   for(int i = 0; i < t; i++)
    {
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0) continue;
@@ -564,13 +525,12 @@ int CountPositions(int magic)
 }
 
 //+------------------------------------------------------------------+
-//| Close all positions of one basket                                 |
+//| Close all positions of a basket                                   |
 //+------------------------------------------------------------------+
 int CloseBasketPositions(int magic)
 {
    int closed = 0;
    trade.SetExpertMagicNumber(magic);
-
    int total = PositionsTotal();
    for(int i = total - 1; i >= 0; i--)
    {
@@ -578,9 +538,7 @@ int CloseBasketPositions(int magic)
       if(ticket == 0) continue;
       if(PositionGetInteger(POSITION_MAGIC) != magic) continue;
       if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-
-      if(trade.PositionClose(ticket, Slippage))
-         closed++;
+      if(trade.PositionClose(ticket, Slippage)) closed++;
    }
    return closed;
 }
@@ -593,39 +551,36 @@ void CloseAllBaskets(string reason)
    for(int b = 0; b < MaxBaskets; b++)
    {
       if(!g_baskets[b].active) continue;
-
       double pnl = GetBasketPnL(g_baskets[b].magic);
-      int nClosed = CloseBasketPositions(g_baskets[b].magic);
+      int nc = CloseBasketPositions(g_baskets[b].magic);
       g_totalCycles++;
       g_totalProfit += pnl;
-      g_totalTrades += nClosed;
-
-      Print("B#", b, " CLOSED [", reason, "] $", DoubleToString(pnl, 2));
+      g_totalTrades += nc;
+      Print("B#", b, " [", reason, "] $", DoubleToString(pnl, 2));
       ResetBasket(b);
    }
 }
 
 //+------------------------------------------------------------------+
-//| Reset basket state                                                |
+//| Reset basket                                                      |
 //+------------------------------------------------------------------+
 void ResetBasket(int b)
 {
    int magic = (b < ArraySize(g_baskets)) ? g_baskets[b].magic : BaseMagic + b + 1;
-
    g_baskets[b].magic         = magic;
    g_baskets[b].currentLevel  = 0;
    g_baskets[b].recoveryDir   = -1;
+   g_baskets[b].trendBias     = -1;
    g_baskets[b].lastBuyPrice  = 0;
    g_baskets[b].lastSellPrice = 0;
    g_baskets[b].entryMid      = 0;
-   g_baskets[b].gridStep      = 0;
    g_baskets[b].active        = false;
    g_baskets[b].posCount      = 0;
    g_baskets[b].openTime      = 0;
 }
 
 //+------------------------------------------------------------------+
-//| Recover baskets from existing positions after restart             |
+//| Recover baskets after restart                                     |
 //+------------------------------------------------------------------+
 void RecoverAllBaskets()
 {
@@ -635,9 +590,9 @@ void RecoverAllBaskets()
       int posCnt = CountPositions(magic);
       if(posCnt == 0) continue;
 
-      double hiB = 0, loB = 999999, hiS = 0, loS = 999999;
-      int nB = 0, nS = 0;
-      double maxBV = 0, maxSV = 0, sumP = 0;
+      double hiB=0, loB=999999, hiS=0, loS=999999;
+      int nB=0, nS=0;
+      double maxBV=0, maxSV=0, sumP=0;
 
       int total = PositionsTotal();
       for(int i = 0; i < total; i++)
@@ -653,21 +608,21 @@ void RecoverAllBaskets()
          sumP += p;
 
          if(t == POSITION_TYPE_BUY)
-         {  nB++; hiB = MathMax(hiB, p); loB = MathMin(loB, p); maxBV = MathMax(maxBV, v); }
+         { nB++; hiB=MathMax(hiB,p); loB=MathMin(loB,p); maxBV=MathMax(maxBV,v); }
          else
-         {  nS++; hiS = MathMax(hiS, p); loS = MathMin(loS, p); maxSV = MathMax(maxSV, v); }
+         { nS++; hiS=MathMax(hiS,p); loS=MathMin(loS,p); maxSV=MathMax(maxSV,v); }
       }
 
       if(maxBV > maxSV)
-      {  g_baskets[b].recoveryDir = 0; g_baskets[b].lastBuyPrice = loB; g_baskets[b].lastSellPrice = loS; }
+      { g_baskets[b].recoveryDir=0; g_baskets[b].lastBuyPrice=loB; g_baskets[b].lastSellPrice=loS; }
       else if(maxSV > maxBV)
-      {  g_baskets[b].recoveryDir = 1; g_baskets[b].lastBuyPrice = hiB; g_baskets[b].lastSellPrice = hiS; }
+      { g_baskets[b].recoveryDir=1; g_baskets[b].lastBuyPrice=hiB; g_baskets[b].lastSellPrice=hiS; }
       else
-      {  g_baskets[b].recoveryDir = -1; g_baskets[b].lastBuyPrice = hiB; g_baskets[b].lastSellPrice = loS; }
+      { g_baskets[b].recoveryDir=-1; g_baskets[b].lastBuyPrice=hiB; g_baskets[b].lastSellPrice=loS; }
 
-      g_baskets[b].currentLevel = MathMax(0, (posCnt / 2) - 1);
+      g_baskets[b].currentLevel = MathMax(0, (posCnt/2) - 1);
       g_baskets[b].entryMid     = sumP / posCnt;
-      g_baskets[b].gridStep     = GetEffectiveGridStep();
+      g_baskets[b].trendBias    = (maxBV > maxSV) ? 0 : (maxSV > maxBV) ? 1 : -1;
       g_baskets[b].active       = true;
       g_baskets[b].posCount     = posCnt;
       g_baskets[b].openTime     = TimeCurrent();
@@ -675,29 +630,26 @@ void RecoverAllBaskets()
 }
 
 //+------------------------------------------------------------------+
-//| Dashboard — chart overlay (live mode only)                        |
+//| Dashboard                                                         |
 //+------------------------------------------------------------------+
 void CreateDashboard()
 {
    string pfx = "HG_";
-   int x = 10, y = 22, gap = 15;
-
    ObjectCreate(0, pfx+"bg", OBJ_RECTANGLE_LABEL, 0, 0, 0);
    ObjectSetInteger(0, pfx+"bg", OBJPROP_XDISTANCE, 5);
    ObjectSetInteger(0, pfx+"bg", OBJPROP_YDISTANCE, 18);
-   ObjectSetInteger(0, pfx+"bg", OBJPROP_XSIZE, 320);
-   ObjectSetInteger(0, pfx+"bg", OBJPROP_YSIZE, 35 + (MaxBaskets + 4) * gap);
+   ObjectSetInteger(0, pfx+"bg", OBJPROP_XSIZE, 330);
+   ObjectSetInteger(0, pfx+"bg", OBJPROP_YSIZE, 30 + (MaxBaskets + 5) * 15);
    ObjectSetInteger(0, pfx+"bg", OBJPROP_BGCOLOR, C'15,15,25');
    ObjectSetInteger(0, pfx+"bg", OBJPROP_BORDER_COLOR, clrDodgerBlue);
    ObjectSetInteger(0, pfx+"bg", OBJPROP_CORNER, CORNER_LEFT_UPPER);
 
-   int nLabels = MaxBaskets + 5;
-   for(int i = 0; i < nLabels; i++)
+   for(int i = 0; i < MaxBaskets + 6; i++)
    {
       string name = pfx + "R" + IntegerToString(i);
       ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
-      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
-      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y + i * gap);
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, 22 + i * 15);
       ObjectSetInteger(0, name, OBJPROP_COLOR, clrWhite);
       ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 8);
       ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
@@ -713,7 +665,6 @@ void UpdateDashboard()
    int active = CountActive();
    int totalPos = 0;
    double floatPnL = 0;
-
    for(int b = 0; b < MaxBaskets; b++)
    {
       if(!g_baskets[b].active) continue;
@@ -721,62 +672,57 @@ void UpdateDashboard()
       floatPnL += GetBasketPnL(g_baskets[b].magic);
    }
 
-   double atr = GetATR();
+   int trend = DetectTrend();
+   string trendStr = trend == 0 ? "BULL" : trend == 1 ? "BEAR" : "FLAT";
 
-   // Header
-   ObjectSetString(0, pfx+"R0", OBJPROP_TEXT, "══ HEDGED GRID v3 ══");
+   ObjectSetString(0, pfx+"R0", OBJPROP_TEXT, "══ HEDGED GRID v4 ══");
    ObjectSetInteger(0, pfx+"R0", OBJPROP_COLOR, clrDodgerBlue);
 
-   // ATR + grid info
    ObjectSetString(0, pfx+"R1", OBJPROP_TEXT,
-      "ATR: " + DoubleToString(atr, 2) +
-      "  Step: " + DoubleToString(UseATR ? atr * ATR_GridMult : GridStep, 2) +
-      "  Dist: " + DoubleToString(UseATR ? atr * ATR_DistMult : MinDistance, 2));
-   ObjectSetInteger(0, pfx+"R1", OBJPROP_COLOR, clrDarkGray);
+      "Trend: " + trendStr + "  Step: " + DoubleToString(GridStep, 1));
+   ObjectSetInteger(0, pfx+"R1", OBJPROP_COLOR,
+      trend == 0 ? clrLime : trend == 1 ? clrOrangeRed : clrGray);
 
-   // Summary
    color pc = floatPnL >= 0 ? clrLime : clrOrangeRed;
    ObjectSetString(0, pfx+"R2", OBJPROP_TEXT,
-      "Baskets: " + IntegerToString(active) + "/" + IntegerToString(MaxBaskets) +
+      "Active: " + IntegerToString(active) + "/" + IntegerToString(MaxBaskets) +
       "  Pos: " + IntegerToString(totalPos) +
-      "  Float: $" + DoubleToString(floatPnL, 2));
+      "  $" + DoubleToString(floatPnL, 2));
    ObjectSetInteger(0, pfx+"R2", OBJPROP_COLOR, pc);
 
-   // Per basket
    for(int b = 0; b < MaxBaskets; b++)
    {
       string row;
       if(g_baskets[b].active)
       {
-         string d = g_baskets[b].recoveryDir == 0 ? "B" :
-                    g_baskets[b].recoveryDir == 1 ? "S" : "-";
+         string d = g_baskets[b].recoveryDir == 0 ? "Brec" :
+                    g_baskets[b].recoveryDir == 1 ? "Srec" : "---";
+         string tb = g_baskets[b].trendBias == 0 ? "BU" :
+                     g_baskets[b].trendBias == 1 ? "BE" : "N";
          double bp = GetBasketPnL(g_baskets[b].magic);
-         row = " #" + IntegerToString(b) +
+         row = " #" + IntegerToString(b) + " " + tb +
                " Lv" + IntegerToString(g_baskets[b].currentLevel) +
-               " " + d +
-               " stp:" + DoubleToString(g_baskets[b].gridStep, 1) +
-               " $" + DoubleToString(bp, 2);
+               " " + d + " $" + DoubleToString(bp, 2);
       }
-      else
-         row = " #" + IntegerToString(b) + " [idle]";
+      else row = " #" + IntegerToString(b) + " [idle]";
 
       ObjectSetString(0, pfx+"R"+IntegerToString(3+b), OBJPROP_TEXT, row);
       ObjectSetInteger(0, pfx+"R"+IntegerToString(3+b), OBJPROP_COLOR,
          g_baskets[b].active ? clrWhite : clrDimGray);
    }
 
-   // Totals
-   int f1 = 3 + MaxBaskets;
-   ObjectSetString(0, pfx+"R"+IntegerToString(f1), OBJPROP_TEXT,
+   int f = 3 + MaxBaskets;
+   ObjectSetString(0, pfx+"R"+IntegerToString(f), OBJPROP_TEXT,
       "Cycles: " + IntegerToString(g_totalCycles) +
-      "  Trades: " + IntegerToString(g_totalTrades) +
-      "  P/L: $" + DoubleToString(g_totalProfit, 2));
-   ObjectSetInteger(0, pfx+"R"+IntegerToString(f1), OBJPROP_COLOR, clrGold);
+      " Trades: " + IntegerToString(g_totalTrades) +
+      " P/L: $" + DoubleToString(g_totalProfit, 2));
+   ObjectSetInteger(0, pfx+"R"+IntegerToString(f), OBJPROP_COLOR, clrGold);
 
-   ObjectSetString(0, pfx+"R"+IntegerToString(f1+1), OBJPROP_TEXT,
+   ObjectSetString(0, pfx+"R"+IntegerToString(f+1), OBJPROP_TEXT,
       "DD: $" + DoubleToString(MaxDrawdown, 0) + "/b  $" +
-      DoubleToString(MaxTotalDrawdown, 0) + "/tot");
-   ObjectSetInteger(0, pfx+"R"+IntegerToString(f1+1), OBJPROP_COLOR, clrDimGray);
+      DoubleToString(MaxTotalDrawdown, 0) + "/tot  Margin: " +
+      DoubleToString(MinMarginPct, 0) + "%");
+   ObjectSetInteger(0, pfx+"R"+IntegerToString(f+1), OBJPROP_COLOR, clrDimGray);
 
    ChartRedraw();
 }
