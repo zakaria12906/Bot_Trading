@@ -1,168 +1,371 @@
-# Fixed-Lot Grid Recovery Bot
+# Hedged Grid Bot — Guide Complet pour Débutant
 
-A **regime-filtered, event-aware, adaptive-step, fixed-lot basket strategy** with hard shutdown rules. Built for MetaTrader 5 with optional TradingView webhook integration.
+## Qu'est-ce que ce bot ?
 
-## Philosophy
-
-This bot does **not** try to win every trade or trade every day. It trades **rarely and selectively** — only when the market regime fits the grid's mean-reversion assumptions. When those assumptions break down, the bot exits aggressively and stands down.
-
-Key principles:
-- **Fixed lot** — equal position size at every grid level; no martingale
-- **Adaptive step** — grid spacing is ATR-normalized, not fixed pips
-- **Regime-gated** — every new cycle and grid add must earn permission through volatility, trend, spread, and structure checks
-- **Hard kill-switches** — equity stop, daily loss cap, spread explosion, time stop, and session controls
-- **Three operating modes** — Normal → Defensive → Shutdown
-
-## Architecture
+Un bot qui ouvre BUY + SELL en même temps sur le Gold (XAU/USD), puis ajoute
+des positions avec des lots croissants quand le prix bouge. Quand le profit
+net de toutes les positions atteint un seuil ($15), il ferme tout et recommence.
 
 ```
-main.py                  ← entry point
-core/
-  bot.py                 ← orchestrator: one SymbolEngine per symbol
-  grid_manager.py        ← adaptive grid construction
-  basket_manager.py      ← basket lifecycle and exit hierarchy
-  risk_manager.py        ← Normal / Defensive / Shutdown mode controller
-filters/
-  regime_filter.py       ← CALM / CAUTION / HOSTILE classification
-  volatility_filter.py   ← ATR ratio gating
-  spread_filter.py       ← bid-ask spread monitoring
-  session_filter.py      ← trading session window enforcement
-  news_filter.py         ← economic calendar lockout
-  breakout_detector.py   ← trend/impulse detection (multi-signal scoring)
-indicators/
-  atr.py                 ← Average True Range (Wilder-smoothed)
-  adx.py                 ← Average Directional Index
-  moving_average.py      ← SMA, EMA, distance-from-MA
-  candle_analysis.py     ← impulse candles, overlap detection
-broker/
-  base_broker.py         ← abstract broker interface
-  mt5_connector.py       ← MetaTrader 5 implementation
-webhook/
-  server.py              ← Flask webhook for TradingView alerts
-utils/
-  logger.py              ← rotating file + console logger
-  helpers.py             ← timeframe maps, session checks, conversions
+Séquence de lots : 0.01, 0.01, 0.02, 0.03, 0.05, 0.07, 0.11, 0.17, 0.25
 ```
 
-## Decision Flow (per tick)
+---
+
+## Structure du projet
 
 ```
-1. Daily reset check
-2. Cooldown active? → skip
-3. Basket open?
-   YES → evaluate risk mode
-         SHUTDOWN  → close all, record loss, cooldown
-         check time stop → close if expired
-         check basket TP → close if target hit
-         check scratch exit → close near breakeven if regime deteriorated
-         NORMAL → check if price reached next grid level → add position
-   NO  → can open new cycle?
-         all filters pass + directional bias found → open initial position + grid plan
+Trading_view_Bot/
+├── main.py              # Lance le bot LIVE sur MetaTrader 5
+├── backtest.py          # Test sur données historiques (fonctionne sur Mac)
+├── config.yaml          # Tous les paramètres du bot
+├── .env.example         # Template pour les identifiants MT5
+├── requirements.txt     # Dépendances Python
+├── broker/
+│   ├── base_broker.py   # Interface abstraite
+│   └── mt5_connector.py # Connexion MetaTrader 5
+├── core/
+│   ├── lot_sequence.py  # Calcul de la séquence de lots
+│   ├── basket.py        # Gestion du panier de positions
+│   ├── engine.py        # Logique principale du bot
+│   └── bot.py           # Orchestrateur multi-symboles
+└── utils/
+    └── logger.py        # Logs console + fichier
 ```
 
-## Exit Priority Hierarchy
+---
 
-| Priority | Condition | Action |
-|----------|-----------|--------|
-| 1 | Equity stop breached | Close all, shutdown |
-| 2 | Regime failure (HOSTILE) | Close all, shutdown |
-| 3 | Time stop expired | Close basket |
-| 4 | Basket TP reached | Close basket (profit) |
-| 5 | Scratch exit available | Close near breakeven |
+## ÉTAPE 1 — Backtest sur Mac (maintenant, sans MT5)
 
-## Three Risk Modes
+### 1.1 Ouvrir le Terminal
 
-| Mode | Trigger | Allowed |
-|------|---------|---------|
-| **Normal** | All filters pass | Open cycles, add grid levels, take TP |
-| **Defensive** | Regime CAUTION, spread widened, news approaching, breakout score 2 | No new cycles, no adds, prioritize exit |
-| **Shutdown** | Equity stop, HOSTILE regime, spread explosion, breakout score 3+, session closed | Close everything immediately |
+Appuie sur `Cmd + Espace`, tape `Terminal`, appuie `Enter`.
 
-## Setup
-
-### Prerequisites
-
-- Windows VPS with MetaTrader 5 installed
-- Python 3.10+
-- MT5 terminal running and logged in
-
-### Installation
+### 1.2 Aller dans le dossier du bot
 
 ```bash
-git clone <repo-url> && cd Trading_view_Bot
-pip install -r requirements.txt
+cd ~/Library/Mobile\ Documents/com~apple~CloudDocs/mohamed/Trading_view_Bot
 ```
 
-### Configuration
-
-1. Copy `.env.example` to `.env` and fill in your MT5 credentials:
+### 1.3 Créer un environnement Python isolé
 
 ```bash
-cp .env.example .env
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
-2. Edit `config.yaml` to configure symbols, risk parameters, and session windows. Every parameter from the blueprint is exposed.
+Tu verras `(.venv)` apparaître au début de la ligne. Ça veut dire que tu es
+dans l'environnement isolé.
 
-### Running
+### 1.4 Installer les dépendances du backtest
 
 ```bash
+pip install yfinance pandas numpy matplotlib
+```
+
+### 1.5 Lancer le backtest
+
+```bash
+# Test de base — Gold, 24 mois
+python backtest.py
+
+# Personnaliser les paramètres
+python backtest.py --months 24 --step 5.0 --tp 15.0
+
+# Tester différents paramètres
+python backtest.py --step 4.0 --tp 12.0       # step plus serré, TP plus bas
+python backtest.py --step 7.0 --tp 20.0       # step plus large, TP plus haut
+python backtest.py --max-levels 6              # limiter à 6 niveaux (plus safe)
+```
+
+### 1.6 Lire les résultats
+
+Après le backtest, tu auras :
+- **Dans le terminal** : rapport complet (win rate, P/L, drawdown)
+- **backtest_hedged_grid.png** : graphique avec courbe d'équité
+- **backtest_hedged_grid_trades.csv** : détail de chaque cycle
+
+**Ce qu'il faut regarder :**
+
+| Métrique | Bon signe | Mauvais signe |
+|---|---|---|
+| Win rate | > 90% | < 80% |
+| Profit factor | > 5 | < 2 |
+| Max drawdown | < $50 | > $200 |
+| Avg duration | < 200 bars | > 500 bars |
+| Level 7-8 % | < 10% | > 30% |
+
+---
+
+## ÉTAPE 2 — Installer MetaTrader 5 sur Mac
+
+MT5 est un logiciel Windows. Sur Mac, tu as besoin d'une solution pour
+le faire tourner.
+
+### Option A — Parallels Desktop (recommandé, ~100€)
+
+1. **Télécharger Parallels** : [parallels.com](https://www.parallels.com)
+2. **Installer** : ouvre le `.dmg` et suis les instructions
+3. **Windows 11** : Parallels va te proposer d'installer Windows automatiquement
+4. **Attendre** : l'installation prend 15-30 minutes
+
+### Option B — UTM (gratuit, plus lent)
+
+```bash
+brew install --cask utm
+```
+
+1. Télécharger l'ISO Windows ARM : [microsoft.com/software-download/windowsinsiderpreviewarm64](https://www.microsoft.com/software-download/windowsinsiderpreviewarm64)
+2. Ouvrir UTM → New → Virtualize → Windows → sélectionner l'ISO
+3. Donner 4 GB de RAM et 60 GB de disque
+4. Installer Windows en suivant les étapes
+
+### Option C — VPS Cloud (pour trading 24/7, ~10-30€/mois)
+
+Providers : Contabo, Vultr, AWS EC2, ForexVPS
+
+---
+
+## ÉTAPE 3 — Installer MT5 + Python dans Windows
+
+**Tout ce qui suit se fait DANS Windows (Parallels/UTM/VPS).**
+
+### 3.1 Installer MetaTrader 5
+
+1. Ouvrir le navigateur dans Windows
+2. Aller sur le site de ton broker (ex: Exness, XM, IC Markets)
+3. Télécharger MetaTrader 5
+4. Installer et lancer
+5. Se connecter avec un **compte DEMO** (très important : DEMO d'abord)
+
+### 3.2 Configurer MT5
+
+1. Aller dans **Tools → Options → Expert Advisors**
+2. Cocher :
+   - ✅ Allow algorithmic trading
+   - ✅ Allow DLL imports
+3. Cliquer OK
+
+### 3.3 Installer Python dans Windows
+
+1. Télécharger Python 3.11 : [python.org/downloads](https://python.org/downloads)
+2. **IMPORTANT** : cocher ✅ "Add Python to PATH" pendant l'installation
+3. Ouvrir **PowerShell** (chercher dans le menu démarrer)
+4. Vérifier :
+
+```powershell
+python --version
+```
+
+Tu dois voir `Python 3.11.x`
+
+### 3.4 Installer les dépendances du bot
+
+```powershell
+pip install MetaTrader5 pyyaml python-dotenv
+```
+
+---
+
+## ÉTAPE 4 — Copier le bot dans Windows
+
+### Depuis Parallels
+
+Le disque Mac est accessible dans Windows à `\\Mac\Home`.
+
+1. Ouvrir l'Explorateur de fichiers Windows
+2. Aller à : `\\Mac\Home\Library\Mobile Documents\com~apple~CloudDocs\mohamed\Trading_view_Bot`
+3. Copier tout le dossier dans `C:\Users\[ton_nom]\Documents\Trading_view_Bot`
+
+### Depuis UTM ou VPS
+
+```powershell
+# Dans PowerShell Windows
+git clone https://github.com/zakaria12906/MetaTrader_Bot.git
+cd MetaTrader_Bot
+pip install MetaTrader5 pyyaml python-dotenv
+```
+
+---
+
+## ÉTAPE 5 — Configurer le bot
+
+### 5.1 Créer le fichier .env
+
+Dans le dossier du bot, copie `.env.example` et renomme-le `.env` :
+
+```powershell
+copy .env.example .env
+```
+
+Ouvre `.env` avec le Bloc-notes et remplis :
+
+```
+MT5_LOGIN=12345678
+MT5_PASSWORD=ton_mot_de_passe
+MT5_SERVER=Exness-MT5Trial
+MT5_PATH=C:\Program Files\MetaTrader 5\terminal64.exe
+```
+
+**Pour trouver ces infos :**
+- `MT5_LOGIN` : ton numéro de compte (visible dans MT5 en haut)
+- `MT5_PASSWORD` : le mot de passe de ton compte trading
+- `MT5_SERVER` : visible dans MT5 → File → Login to Trade Account
+- `MT5_PATH` : clic droit sur l'icône MT5 → Properties → Target
+
+### 5.2 Vérifier config.yaml
+
+Le fichier est déjà configuré pour le Gold. Les paramètres importants :
+
+```yaml
+symbols:
+  XAUUSDs:                    # ← le nom du symbole chez ton broker
+    enabled: true
+    base_lot: 0.01            # ← taille minimum (ne change pas pour commencer)
+    max_levels: 9             # ← profondeur maximum de la grille
+    grid_step: 5.0            # ← distance entre les niveaux (5 points Gold)
+    basket_tp: 15.0           # ← profit cible par cycle ($15)
+```
+
+**IMPORTANT** : Le nom du symbole peut varier selon ton broker :
+- Exness : `XAUUSDm` ou `XAUUSD`
+- IC Markets : `XAUUSD`
+- XM : `GOLD`
+
+Vérifie dans MT5 quel est le nom exact et mets-le dans `config.yaml`.
+
+---
+
+## ÉTAPE 6 — Premier test (DEMO)
+
+### 6.1 Lancer MT5
+
+1. Ouvre MetaTrader 5
+2. Connecte-toi à ton compte **DEMO**
+3. Vérifie que tu vois le prix du Gold bouger en temps réel
+
+### 6.2 Lancer le bot
+
+Ouvre PowerShell dans le dossier du bot :
+
+```powershell
+cd C:\Users\[ton_nom]\Documents\Trading_view_Bot
 python main.py
-# or with a custom config
-python main.py --config my_config.yaml
 ```
 
-## TradingView Webhook
-
-When `webhook.enabled: true` in config, the bot starts a Flask server that accepts POST requests.
-
-### Endpoint
+Tu dois voir :
 
 ```
-POST /webhook
+Hedged Grid Bot starting
+Connected — Exness-MT5Trial | acct 12345678 | balance 10000.00 USD
+Engine registered: XAUUSDs (magic 888001)
+XAUUSDs lot sequence: [0.01, 0.01, 0.02, 0.03, 0.05, 0.07, 0.11, 0.17, 0.25]
+XAUUSDs engine started | step=5.00 | tp=15.00 | levels=9
 ```
 
-### Payload
+### 6.3 Surveiller
 
-```json
-{
-  "secret": "your_webhook_secret",
-  "symbol": "EURUSD",
-  "direction": "BUY"
-}
+- Regarde dans MT5 : des positions vont apparaître dans l'onglet "Trade"
+- Les logs sont dans `logs/hedged_grid.log`
+- Pour arrêter : appuie `Ctrl + C` dans PowerShell
+
+---
+
+## ÉTAPE 7 — Tester sur 3 ans de données
+
+Le backtest avec yfinance te donne ~24 mois max (limite de l'API gratuite).
+Pour 3 ans complets, tu as deux options :
+
+### Option A — Backtest yfinance (gratuit, ~24 mois max)
+
+```bash
+# Sur ton Mac
+cd ~/Library/Mobile\ Documents/com~apple~CloudDocs/mohamed/Trading_view_Bot
+source .venv/bin/activate
+python backtest.py --months 36
 ```
 
-### Monitoring
+Note : yfinance retourne souvent ~24 mois de données 1h pour Gold.
+C'est suffisant pour tester.
 
+### Option B — Strategy Tester de MT5 (3 ans+, données complètes)
+
+MT5 a un testeur de stratégie intégré, mais il nécessite un EA (Expert Advisor)
+en MQL5. Le bot Python ne peut pas être utilisé directement dans le Strategy Tester.
+
+Pour tester sur 3 ans+ avec les données MT5, tu peux :
+
+1. Lancer le bot en mode DEMO pendant 1-3 mois en temps réel
+2. Analyser les résultats dans les logs et l'historique MT5
+
+---
+
+## Paramètres à tester
+
+| Scénario | step | tp | max_levels | Risque |
+|---|---|---|---|---|
+| Conservateur | 7.0 | 20.0 | 6 | Faible |
+| **Standard** | **5.0** | **15.0** | **9** | **Moyen** |
+| Agressif | 3.0 | 10.0 | 9 | Élevé |
+
+Lance le backtest avec chaque scénario :
+
+```bash
+# Conservateur
+python backtest.py --step 7.0 --tp 20.0 --max-levels 6
+
+# Standard
+python backtest.py --step 5.0 --tp 15.0
+
+# Agressif
+python backtest.py --step 3.0 --tp 10.0
 ```
-GET /health     → {"status": "ok"}
-GET /status     → account balance, equity, per-symbol basket state and risk mode
+
+Compare les résultats et choisis celui qui te convient.
+
+---
+
+## Checklist de sécurité
+
+- [ ] TOUJOURS commencer en compte DEMO
+- [ ] JAMAIS augmenter le lot sans 1 mois de résultats
+- [ ] JAMAIS laisser tourner pendant NFP / FOMC (couper le bot)
+- [ ] Vérifier les logs chaque jour
+- [ ] Si drawdown > $100 sur un compte $1000 → couper le bot
+- [ ] Ne JAMAIS mettre d'argent que tu ne peux pas perdre
+
+---
+
+## Commandes de référence rapide
+
+```bash
+# === SUR MAC (backtest) ===
+cd ~/Library/Mobile\ Documents/com~apple~CloudDocs/mohamed/Trading_view_Bot
+source .venv/bin/activate
+python backtest.py --months 24
+
+# === SUR WINDOWS (live) ===
+cd C:\Users\[ton_nom]\Documents\Trading_view_Bot
+python main.py
+
+# === Arrêter le bot ===
+Ctrl + C
+
+# === Voir les logs en temps réel ===
+# PowerShell Windows :
+Get-Content logs\hedged_grid.log -Wait -Tail 50
 ```
 
-### TradingView Alert Setup
+---
 
-In TradingView, create an alert with webhook URL `http://your-vps-ip:5000/webhook` and message body:
+## Calendrier des news à éviter
 
-```json
-{"secret": "{{strategy.order.comment}}", "symbol": "EURUSD", "direction": "BUY"}
-```
+| Jour | Événement | Action |
+|---|---|---|
+| 1er vendredi du mois | NFP (Non-Farm Payrolls) | COUPER le bot la veille à 21h |
+| 8× par an (check FOMC) | Décision taux Fed | COUPER le bot 2h avant |
+| ~12ème de chaque mois | CPI (Inflation US) | COUPER le bot la veille à 21h |
 
-## Key Configuration Parameters
+Calendrier : [forexfactory.com](https://www.forexfactory.com/calendar)
 
-| Parameter | Location | Purpose |
-|-----------|----------|---------|
-| `lot_size` | symbols.SYMBOL | Fixed lot for every grid entry |
-| `max_trades` | symbols.SYMBOL | Maximum grid levels (caps exposure) |
-| `basket_tp_currency` | symbols.SYMBOL | Net P/L target in account currency |
-| `grid_step_multiplier` | symbols.SYMBOL | Step = ATR × this multiplier |
-| `min_step_points` | symbols.SYMBOL | Floor for grid step |
-| `max_atr_ratio` | symbols.SYMBOL | Block entries above this ATR ratio |
-| `adx_ceiling` | symbols.SYMBOL | Block entries when ADX exceeds this |
-| `equity_stop_pct` | risk | Hard kill at N% of balance |
-| `max_daily_loss_pct` | risk | Stop for the day at N% |
-| `max_daily_losing_baskets` | risk | Stop after N losing baskets |
-| `news_lockout_minutes` | symbols.SYMBOL | No new cycles within N min of high-impact news |
-| `time_stop_minutes` | symbols.SYMBOL | Max basket lifespan |
-
-## Disclaimer
-
-This bot is a tool for systematic trading, not a profit guarantee. No automated system can eliminate market risk. The bot deliberately skips many market conditions and accepts bounded losses in exchange for avoiding catastrophic ones. Always test on a demo account first.
+Filtre les événements "High Impact" (drapeau rouge) sur USD.

@@ -1,11 +1,8 @@
-__pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
 .env
-logs/
-*.log
 .venv/
-venv/
+__pycache__/
+*.pyc
+logs/
+*.png
+*.csv
 .DS_Store

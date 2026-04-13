@@ -1,8 +1,3 @@
 MetaTrader5>=5.0.45
-flask>=3.0
 pyyaml>=6.0
-numpy>=1.26
-pandas>=2.2
-requests>=2.31
 python-dotenv>=1.0
-apscheduler>=3.10

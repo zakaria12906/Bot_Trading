@@ -1,7 +1,7 @@
-"""Abstract broker interface.
+"""Abstract broker interface for the Hedged Grid Bot.
 
-Every concrete broker adapter must implement these methods so the rest of
-the bot remains broker-agnostic.
+Every concrete broker adapter must implement these methods so the core
+engine remains broker-agnostic.
 """
 
 from abc import ABC, abstractmethod
@@ -9,44 +9,35 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Optional
 
+BUY = 0
+SELL = 1
+
 
 @dataclass
 class SymbolInfo:
     name: str
     point: float
     digits: int
-    spread: int            # current spread in points
+    spread: int
     trade_tick_size: float
     trade_tick_value: float
     volume_min: float
     volume_max: float
     volume_step: float
-
-
-@dataclass
-class Bar:
-    time: datetime
-    open: float
-    high: float
-    low: float
-    close: float
-    tick_volume: int
-    real_volume: int = 0
+    contract_size: float = 100_000.0
 
 
 @dataclass
 class Position:
     ticket: int
     symbol: str
-    type: int              # 0 = BUY, 1 = SELL
+    type: int               # 0 = BUY, 1 = SELL
     volume: float
     price_open: float
-    sl: float
-    tp: float
     profit: float
-    swap: float
-    comment: str
-    magic: int
+    swap: float = 0.0
+    comment: str = ""
+    magic: int = 0
     time: datetime = field(default_factory=datetime.utcnow)
 
 
@@ -54,6 +45,7 @@ class Position:
 class OrderResult:
     success: bool
     ticket: int = 0
+    price: float = 0.0
     message: str = ""
 
 
@@ -69,15 +61,12 @@ class BaseBroker(ABC):
     def get_symbol_info(self, symbol: str) -> Optional[SymbolInfo]: ...
 
     @abstractmethod
-    def get_bars(self, symbol: str, timeframe: int, count: int) -> List[Bar]: ...
-
-    @abstractmethod
     def get_tick(self, symbol: str) -> Optional[dict]: ...
 
     @abstractmethod
     def open_position(
         self, symbol: str, direction: int, volume: float,
-        sl: float, tp: float, magic: int, comment: str,
+        magic: int = 0, comment: str = "",
     ) -> OrderResult: ...
 
     @abstractmethod
