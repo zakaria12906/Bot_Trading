@@ -22,19 +22,19 @@
 
 // ── Lot sizing ──
 input double   BaseLot          = 0.01;    // Base lot size
-input int      MaxLevels        = 6;       // Maximum grid depth per basket (6 safe for $1K)
+input int      MaxLevels        = 7;       // Grid depth per basket (7 = lots up to 0.11)
 
 // ── Grid spacing ──
 input bool     UseATR           = true;    // Use ATR for dynamic grid step
 input int      ATR_Period       = 14;      // ATR calculation period
 input ENUM_TIMEFRAMES ATR_TF   = PERIOD_H1;// ATR timeframe
-input double   ATR_GridMult     = 0.50;    // GridStep = ATR × this (when UseATR=true)
-input double   ATR_DistMult     = 0.80;    // MinDistance = ATR × this (when UseATR=true)
-input double   GridStep         = 5.0;     // Fixed grid step (when UseATR=false)
-input double   MinDistance      = 8.0;     // Fixed min distance (when UseATR=false)
+input double   ATR_GridMult     = 0.35;    // GridStep = ATR × this (when UseATR=true)
+input double   ATR_DistMult     = 0.60;    // MinDistance = ATR × this (when UseATR=true)
+input double   GridStep         = 4.0;     // Fixed grid step (when UseATR=false)
+input double   MinDistance      = 7.0;     // Fixed min distance (when UseATR=false)
 
 // ── Basket profit target ──
-input double   BasketTP         = 8.0;     // Close basket when net P/L >= this ($)
+input double   BasketTP         = 6.0;     // Close basket when net P/L >= this ($)
 
 // ── Multi-basket ──
 input int      MaxBaskets       = 2;       // Max simultaneous baskets (2 safe for $1K)
@@ -45,9 +45,9 @@ input int      SessionStart     = 1;       // Session start hour (server time)
 input int      SessionEnd       = 23;      // Session end hour (server time)
 
 // ── Risk management ──
-input double   MaxDrawdown      = 200.0;   // Emergency close ONE basket if loss > this ($)
+input double   MaxDrawdown      = 250.0;   // Emergency close ONE basket if loss > this ($)
 input double   MaxTotalDrawdown = 400.0;   // Emergency close ALL if total loss > this ($)
-input double   MinMarginPct     = 30.0;    // Stop opening if free margin < this % of equity
+input double   MinMarginPct     = 25.0;    // Stop opening if free margin < this % of equity
 input bool     CloseEndOfDay    = false;   // Force close all at SessionEnd
 
 // ── Execution ──
