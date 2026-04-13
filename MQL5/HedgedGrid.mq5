@@ -38,6 +38,8 @@ input double   BasketTP       = 15.0;    // Close basket when net P/L >= this ($
 input int      MagicNumber    = 888001;  // Unique ID for this bot's trades
 input int      SessionStart   = 1;       // Start hour (UTC)
 input int      SessionEnd     = 22;      // End hour (UTC)
+input double   MaxDrawdown    = 500.0;   // Emergency close basket if floating loss > this ($)
+input bool     CloseEndOfDay  = false;   // Force close basket at SessionEnd
 input int      Slippage       = 30;      // Max slippage in points
 
 //+------------------------------------------------------------------+
@@ -98,6 +100,10 @@ int OnInit()
       Print("Recovered existing basket: ", CountMyPositions(), " positions");
    }
 
+   // Chart dashboard
+   if(!MQLInfoInteger(MQL_TESTER))
+      CreateDashboard();
+
    return(INIT_SUCCEEDED);
 }
 
@@ -132,28 +138,60 @@ void OnTick()
    // Basket active → check net P/L
    double netPnL = GetBasketPnL();
 
-   // EXIT: net P/L >= target
+   // EXIT: net P/L >= target → take profit
    if(netPnL >= BasketTP)
    {
       CloseAllPositions("TAKE_PROFIT");
       g_totalCycles++;
-      g_totalProfit += BasketTP;
+      g_totalProfit += netPnL;
 
-      Print("CYCLE #", g_totalCycles, " CLOSED | Net P/L: $",
+      Print("CYCLE #", g_totalCycles, " CLOSED [TP] | Net P/L: $",
             DoubleToString(netPnL, 2), " | Total: $",
             DoubleToString(g_totalProfit, 2));
 
       ResetState();
 
-      // Immediately reopen if in session
       if(inSession)
          OpenInitialPair();
+      return;
+   }
+
+   // SAFETY: max drawdown breached → emergency close
+   if(MaxDrawdown > 0 && netPnL <= -MaxDrawdown)
+   {
+      CloseAllPositions("MAX_DRAWDOWN");
+      g_totalCycles++;
+      g_totalProfit += netPnL;
+
+      Print("CYCLE #", g_totalCycles, " CLOSED [DD STOP] | Net P/L: $",
+            DoubleToString(netPnL, 2), " | Total: $",
+            DoubleToString(g_totalProfit, 2));
+
+      ResetState();
+      return;  // Do NOT reopen after emergency stop
+   }
+
+   // SESSION END: force close basket if configured
+   if(CloseEndOfDay && !inSession)
+   {
+      CloseAllPositions("SESSION_END");
+      g_totalCycles++;
+      g_totalProfit += netPnL;
+
+      Print("CYCLE #", g_totalCycles, " CLOSED [SESSION END] | Net P/L: $",
+            DoubleToString(netPnL, 2), " | Total: $",
+            DoubleToString(g_totalProfit, 2));
+
+      ResetState();
       return;
    }
 
    // CHECK: next grid level
    if(g_currentLevel < MaxLevels - 1)
       CheckNextLevel();
+
+   // Update visual dashboard
+   UpdateDashboard();
 }
 
 //+------------------------------------------------------------------+
@@ -364,7 +402,8 @@ double GetBasketPnL()
       if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
 
       total += PositionGetDouble(POSITION_PROFIT)
-             + PositionGetDouble(POSITION_SWAP);
+             + PositionGetDouble(POSITION_SWAP)
+             + PositionGetDouble(POSITION_COMMISSION);
    }
 
    return total;
@@ -491,5 +530,74 @@ void RecoverState()
    int posCount = buyCount + sellCount;
    g_currentLevel = MathMax(0, (posCount / 2) - 1);
    g_basketActive = true;
+}
+
+//+------------------------------------------------------------------+
+//| On-chart dashboard (live mode only, not in tester)                |
+//+------------------------------------------------------------------+
+void CreateDashboard()
+{
+   string prefix = "HG_";
+   int x = 10, y = 30, gap = 18;
+   color txtColor = clrWhite;
+   int fontSize = 9;
+
+   ObjectCreate(0, prefix + "bg", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, prefix + "bg", OBJPROP_XDISTANCE, 5);
+   ObjectSetInteger(0, prefix + "bg", OBJPROP_YDISTANCE, 25);
+   ObjectSetInteger(0, prefix + "bg", OBJPROP_XSIZE, 260);
+   ObjectSetInteger(0, prefix + "bg", OBJPROP_YSIZE, 180);
+   ObjectSetInteger(0, prefix + "bg", OBJPROP_BGCOLOR, C'30,30,40');
+   ObjectSetInteger(0, prefix + "bg", OBJPROP_BORDER_COLOR, clrDodgerBlue);
+   ObjectSetInteger(0, prefix + "bg", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+
+   string labels[] = {"title", "status", "level", "positions",
+                       "pnl", "cycles", "total", "dd_limit"};
+   for(int i = 0; i < ArraySize(labels); i++)
+   {
+      string name = prefix + labels[i];
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y + i * gap);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, txtColor);
+      ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontSize);
+      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   }
+
+   ObjectSetString(0, prefix + "title", OBJPROP_TEXT, "═══ HEDGED GRID BOT ═══");
+   ObjectSetInteger(0, prefix + "title", OBJPROP_COLOR, clrDodgerBlue);
+}
+
+void UpdateDashboard()
+{
+   if(MQLInfoInteger(MQL_TESTER))
+      return;
+
+   string prefix = "HG_";
+   double pnl = g_basketActive ? GetBasketPnL() : 0.0;
+   string status = g_basketActive ? "ACTIVE" : "IDLE";
+   string recDir = g_recoveryDir == 0 ? "BUY" :
+                   g_recoveryDir == 1 ? "SELL" : "---";
+
+   ObjectSetString(0, prefix + "status",    OBJPROP_TEXT,
+      "Status:     " + status + "  (Recovery: " + recDir + ")");
+   ObjectSetString(0, prefix + "level",     OBJPROP_TEXT,
+      "Level:      " + IntegerToString(g_currentLevel) + " / " + IntegerToString(MaxLevels - 1));
+   ObjectSetString(0, prefix + "positions", OBJPROP_TEXT,
+      "Positions:  " + IntegerToString(CountMyPositions()));
+
+   color pnlColor = pnl >= 0 ? clrLime : clrRed;
+   ObjectSetString(0, prefix + "pnl",      OBJPROP_TEXT,
+      "Net P/L:    $" + DoubleToString(pnl, 2));
+   ObjectSetInteger(0, prefix + "pnl",     OBJPROP_COLOR, pnlColor);
+
+   ObjectSetString(0, prefix + "cycles",   OBJPROP_TEXT,
+      "Cycles:     " + IntegerToString(g_totalCycles));
+   ObjectSetString(0, prefix + "total",    OBJPROP_TEXT,
+      "Total P/L:  $" + DoubleToString(g_totalProfit, 2));
+   ObjectSetString(0, prefix + "dd_limit", OBJPROP_TEXT,
+      "DD Limit:   $" + DoubleToString(MaxDrawdown, 2));
+
+   ChartRedraw();
 }
 //+------------------------------------------------------------------+
