@@ -23,34 +23,34 @@
 //+------------------------------------------------------------------+
 
 // ── Lot sizing ──
-input double   BaseLot          = 0.03;    // Base lot (hedge side)
-input double   BiasMultiplier   = 3.0;     // Trend lot = BaseLot × this (0.09)
-input int      MaxLevels        = 6;       // Grid depth (lots up to 0.21)
+input double   BaseLot          = 0.01;    // Base lot (hedge side)
+input double   BiasMultiplier   = 2.0;     // Trend lot = BaseLot × this (0.02)
+input int      MaxLevels        = 7;       // Grid depth (lots up to 0.11)
 
 // ── Grid spacing ──
-input double   GridStep         = 3.0;     // Points between grid levels
-input double   MinDistance      = 3.5;     // Min points between basket entries
+input double   GridStep         = 2.5;     // Points between grid levels
+input double   MinDistance      = 2.0;     // Min points between basket entries
 
 // ── Take profit ──
-input double   BasketTP         = 8.0;     // Close basket when net P/L >= this ($)
+input double   BasketTP         = 3.0;     // Close basket when net P/L >= this ($)
 
 // ── Multi-basket ──
-input int      MaxBaskets       = 4;       // Simultaneous baskets
+input int      MaxBaskets       = 8;       // Simultaneous baskets
 input int      BaseMagic        = 888000;  // Base magic number
 
 // ── Trend detection (EMA) ──
 input int      EMA_Fast         = 8;       // Fast EMA period
 input int      EMA_Slow         = 21;      // Slow EMA period
-input ENUM_TIMEFRAMES EMA_TF   = PERIOD_M15; // EMA timeframe
+input ENUM_TIMEFRAMES EMA_TF   = PERIOD_M5;  // M5 for faster reaction
 
 // ── Session ──
 input int      SessionStart     = 1;       // Start hour (server time)
 input int      SessionEnd       = 23;      // End hour (server time)
 
 // ── Risk ──
-input double   MaxDrawdown      = 250.0;   // Emergency close ONE basket ($)
-input double   MaxTotalDrawdown = 500.0;   // Emergency close ALL baskets ($)
-input double   MinMarginPct     = 20.0;    // Stop if free margin < this %
+input double   MaxDrawdown      = 120.0;   // Emergency close ONE basket ($)
+input double   MaxTotalDrawdown = 400.0;   // Emergency close ALL baskets ($)
+input double   MinMarginPct     = 15.0;    // Stop if free margin < this %
 input bool     CloseEndOfDay    = false;   // Force close at session end
 
 // ── Execution ──
@@ -352,11 +352,18 @@ void OpenBasket(int b, double bid, double ask)
    double biasLot = NormalizeDouble(BaseLot * BiasMultiplier, 2);
    biasLot = MathMax(biasLot, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN));
 
-   // Determine lots based on trend
+   // Determine lots based on trend — always bias one side
    double buyLot, sellLot;
    if(trend == 0)       { buyLot = biasLot; sellLot = BaseLot; }   // Bullish
    else if(trend == 1)  { buyLot = BaseLot; sellLot = biasLot; }   // Bearish
-   else                 { buyLot = BaseLot; sellLot = BaseLot; }   // Neutral
+   else
+   {
+      // Neutral: use price momentum as tiebreaker
+      double close1 = iClose(_Symbol, PERIOD_M1, 1);
+      double close5 = iClose(_Symbol, PERIOD_M1, 5);
+      if(close1 >= close5) { buyLot = biasLot; sellLot = BaseLot; }
+      else                 { buyLot = BaseLot; sellLot = biasLot; }
+   }
 
    int magic = g_baskets[b].magic;
    trade.SetExpertMagicNumber(magic);
