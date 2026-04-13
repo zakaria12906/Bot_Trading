@@ -23,24 +23,24 @@
 //+------------------------------------------------------------------+
 
 // ── Lot sizing ──
-input double   BaseLot          = 0.01;    // Base lot (hedge side)
-input double   BiasMultiplier   = 2.0;     // Trend lot = BaseLot × this (e.g. 0.02)
-input int      MaxLevels        = 7;       // Grid depth (lots up to 0.11)
+input double   BaseLot          = 0.03;    // Base lot (hedge side)
+input double   BiasMultiplier   = 3.0;     // Trend lot = BaseLot × this (0.09)
+input int      MaxLevels        = 6;       // Grid depth (lots up to 0.21)
 
 // ── Grid spacing ──
-input double   GridStep         = 3.5;     // Points between grid levels
-input double   MinDistance      = 5.0;     // Min points between basket entries
+input double   GridStep         = 3.0;     // Points between grid levels
+input double   MinDistance      = 3.5;     // Min points between basket entries
 
 // ── Take profit ──
-input double   BasketTP         = 5.0;     // Close basket when net P/L >= this ($)
+input double   BasketTP         = 8.0;     // Close basket when net P/L >= this ($)
 
 // ── Multi-basket ──
-input int      MaxBaskets       = 3;       // Simultaneous baskets
+input int      MaxBaskets       = 4;       // Simultaneous baskets
 input int      BaseMagic        = 888000;  // Base magic number
 
 // ── Trend detection (EMA) ──
-input int      EMA_Fast         = 10;      // Fast EMA period
-input int      EMA_Slow         = 30;      // Slow EMA period
+input int      EMA_Fast         = 8;       // Fast EMA period
+input int      EMA_Slow         = 21;      // Slow EMA period
 input ENUM_TIMEFRAMES EMA_TF   = PERIOD_M15; // EMA timeframe
 
 // ── Session ──
@@ -48,9 +48,9 @@ input int      SessionStart     = 1;       // Start hour (server time)
 input int      SessionEnd       = 23;      // End hour (server time)
 
 // ── Risk ──
-input double   MaxDrawdown      = 200.0;   // Emergency close ONE basket ($)
-input double   MaxTotalDrawdown = 350.0;   // Emergency close ALL baskets ($)
-input double   MinMarginPct     = 25.0;    // Stop if free margin < this %
+input double   MaxDrawdown      = 250.0;   // Emergency close ONE basket ($)
+input double   MaxTotalDrawdown = 500.0;   // Emergency close ALL baskets ($)
+input double   MinMarginPct     = 20.0;    // Stop if free margin < this %
 input bool     CloseEndOfDay    = false;   // Force close at session end
 
 // ── Execution ──
