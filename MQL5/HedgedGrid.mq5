@@ -22,22 +22,22 @@
 
 // ── Lot sizing ──
 input double   BaseLot          = 0.01;    // Base lot size
-input int      MaxLevels        = 9;       // Maximum grid depth per basket
+input int      MaxLevels        = 6;       // Maximum grid depth per basket (6 safe for $1K)
 
 // ── Grid spacing ──
 input bool     UseATR           = true;    // Use ATR for dynamic grid step
 input int      ATR_Period       = 14;      // ATR calculation period
 input ENUM_TIMEFRAMES ATR_TF   = PERIOD_H1;// ATR timeframe
-input double   ATR_GridMult     = 0.25;    // GridStep = ATR × this (when UseATR=true)
-input double   ATR_DistMult     = 0.50;    // MinDistance = ATR × this (when UseATR=true)
-input double   GridStep         = 3.0;     // Fixed grid step (when UseATR=false)
-input double   MinDistance      = 5.0;     // Fixed min distance (when UseATR=false)
+input double   ATR_GridMult     = 0.50;    // GridStep = ATR × this (when UseATR=true)
+input double   ATR_DistMult     = 0.80;    // MinDistance = ATR × this (when UseATR=true)
+input double   GridStep         = 5.0;     // Fixed grid step (when UseATR=false)
+input double   MinDistance      = 8.0;     // Fixed min distance (when UseATR=false)
 
 // ── Basket profit target ──
 input double   BasketTP         = 8.0;     // Close basket when net P/L >= this ($)
 
 // ── Multi-basket ──
-input int      MaxBaskets       = 5;       // Max simultaneous baskets
+input int      MaxBaskets       = 2;       // Max simultaneous baskets (2 safe for $1K)
 input int      BaseMagic        = 888000;  // Base magic number
 
 // ── Session ──
@@ -45,8 +45,9 @@ input int      SessionStart     = 1;       // Session start hour (server time)
 input int      SessionEnd       = 23;      // Session end hour (server time)
 
 // ── Risk management ──
-input double   MaxDrawdown      = 150.0;   // Emergency close ONE basket if loss > this ($)
-input double   MaxTotalDrawdown = 500.0;   // Emergency close ALL if total loss > this ($)
+input double   MaxDrawdown      = 200.0;   // Emergency close ONE basket if loss > this ($)
+input double   MaxTotalDrawdown = 400.0;   // Emergency close ALL if total loss > this ($)
+input double   MinMarginPct     = 30.0;    // Stop opening if free margin < this % of equity
 input bool     CloseEndOfDay    = false;   // Force close all at SessionEnd
 
 // ── Execution ──
@@ -174,6 +175,41 @@ double GetATR()
 }
 
 //+------------------------------------------------------------------+
+//| Check if we have enough free margin to open a position            |
+//+------------------------------------------------------------------+
+bool HasEnoughMargin(double lot)
+{
+   double equity     = AccountInfoDouble(ACCOUNT_EQUITY);
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+
+   if(equity <= 0) return false;
+
+   double freePct = (freeMargin / equity) * 100.0;
+   if(freePct < MinMarginPct)
+   {
+      static datetime lastWarn = 0;
+      if(TimeCurrent() - lastWarn > 60)
+      {
+         Print("MARGIN GUARD: free margin ", DoubleToString(freePct, 1),
+               "% < ", DoubleToString(MinMarginPct, 1), "% — skipping open");
+         lastWarn = TimeCurrent();
+      }
+      return false;
+   }
+
+   // Also check if broker would accept this trade
+   double marginRequired = 0;
+   if(!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lot,
+                        SymbolInfoDouble(_Symbol, SYMBOL_ASK), marginRequired))
+      return true;  // Can't calculate, let broker decide
+
+   if(marginRequired > freeMargin * 0.5)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
 //| Get effective grid step (ATR-based or fixed)                      |
 //+------------------------------------------------------------------+
 double GetEffectiveGridStep()
@@ -295,6 +331,10 @@ void OnTick()
 //+------------------------------------------------------------------+
 bool TryOpenNewBasket(double bid, double ask)
 {
+   // Margin guard — don't open if not enough free margin
+   if(!HasEnoughMargin(BaseLot))
+      return false;
+
    double mid = (bid + ask) / 2.0;
    double minDist = GetEffectiveMinDist();
 
@@ -396,6 +436,11 @@ void AddLevel(int b, int recovDir, double bid, double ask)
 {
    int nextLv = g_baskets[b].currentLevel + 1;
    if(nextLv >= MaxLevels) return;
+
+   // Margin guard before adding more positions
+   double nextLot = GetLot(nextLv);
+   if(!HasEnoughMargin(nextLot + BaseLot))
+      return;
 
    if(g_baskets[b].recoveryDir == -1)
       g_baskets[b].recoveryDir = recovDir;
