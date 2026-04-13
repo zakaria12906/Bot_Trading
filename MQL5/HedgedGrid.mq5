@@ -88,11 +88,22 @@ int      g_totalTrades  = 0;
 //+------------------------------------------------------------------+
 //| OnInit                                                            |
 //+------------------------------------------------------------------+
+ENUM_ORDER_TYPE_FILLING DetectFilling()
+{
+   long modes = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   if((modes & SYMBOL_FILLING_FOK) != 0) return ORDER_FILLING_FOK;
+   if((modes & SYMBOL_FILLING_IOC) != 0) return ORDER_FILLING_IOC;
+   return ORDER_FILLING_RETURN;
+}
+
 int OnInit()
 {
    trade.SetExpertMagicNumber(BaseMagic);
    trade.SetDeviationInPoints(Slippage);
-   trade.SetTypeFilling(ORDER_FILLING_IOC);
+
+   ENUM_ORDER_TYPE_FILLING fill = DetectFilling();
+   trade.SetTypeFilling(fill);
+   Print("Filling mode: ", EnumToString(fill));
 
    // Lot sequence
    double mults[9] = {1, 1, 2, 3, 5, 7, 11, 17, 25};
@@ -297,7 +308,17 @@ bool TryOpenNewBasket(double bid, double ask)
    biasLot = MathMax(biasLot, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN));
 
    if(!HasEnoughMargin(biasLot + BaseLot))
+   {
+      static datetime lastWarn = 0;
+      if(TimeCurrent() - lastWarn > 60)
+      {
+         Print("MARGIN BLOCK: lot=", DoubleToString(biasLot + BaseLot, 2),
+               " | Free=", DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2),
+               " | Equity=", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2));
+         lastWarn = TimeCurrent();
+      }
       return false;
+   }
 
    double mid = (bid + ask) / 2.0;
 
@@ -344,7 +365,9 @@ void OpenBasket(int b, double bid, double ask)
    if(!trade.Buy(buyLot, _Symbol, ask, 0, 0,
                   "HG_B" + IntegerToString(b) + "_L0_BUY"))
    {
-      Print("B#", b, " BUY failed: ", trade.ResultRetcodeDescription());
+      Print("B#", b, " BUY FAIL code=", trade.ResultRetcode(),
+            " desc=", trade.ResultRetcodeDescription(),
+            " lot=", DoubleToString(buyLot, 2), " ask=", DoubleToString(ask, _Digits));
       return;
    }
 
@@ -352,7 +375,9 @@ void OpenBasket(int b, double bid, double ask)
    if(!trade.Sell(sellLot, _Symbol, bid, 0, 0,
                    "HG_B" + IntegerToString(b) + "_L0_SELL"))
    {
-      Print("B#", b, " SELL failed — closing BUY");
+      Print("B#", b, " SELL FAIL code=", trade.ResultRetcode(),
+            " desc=", trade.ResultRetcodeDescription(),
+            " lot=", DoubleToString(sellLot, 2), " bid=", DoubleToString(bid, _Digits));
       CloseBasketPositions(magic);
       return;
    }
