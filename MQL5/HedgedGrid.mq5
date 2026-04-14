@@ -13,7 +13,7 @@
 //+------------------------------------------------------------------+
 
 #property copyright "Hedged Grid Bot v4"
-#property version   "4.00"
+#property version   "4.01"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -25,7 +25,8 @@
 // ── Lot sizing ──
 input double   BaseLot          = 0.01;    // Base lot (hedge side)
 input double   BiasMultiplier   = 2.0;     // Trend lot = BaseLot × this (0.02)
-input int      MaxLevels        = 7;       // Grid depth (lots up to 0.11)
+input double   MaxLotPerPosition = 0.02;   // Hard cap per order (0 = no cap). Recovery lots too.
+input int      MaxLevels        = 7;       // Grid depth (sequence capped by MaxLotPerPosition)
 
 // ── Grid spacing ──
 input double   GridStep         = 2.5;     // Points between grid levels
@@ -87,6 +88,22 @@ double   g_totalProfit  = 0.0;
 int      g_totalTrades  = 0;
 
 //+------------------------------------------------------------------+
+//| Volume: broker step + optional hard max (stops 0.09-style lots)   |
+//+------------------------------------------------------------------+
+double NormalizeVolume(double lot)
+{
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(MaxLotPerPosition > 0.0)
+      lot = MathMin(lot, MaxLotPerPosition);
+   lot = MathMax(lot, minLot);
+   lot = MathMin(lot, maxLot);
+   lot = MathFloor(lot / lotStep) * lotStep;
+   return NormalizeDouble(lot, 2);
+}
+
+//+------------------------------------------------------------------+
 //| OnInit                                                            |
 //+------------------------------------------------------------------+
 ENUM_ORDER_TYPE_FILLING DetectFilling()
@@ -112,6 +129,7 @@ int OnInit()
    {
       LotSeq[i] = NormalizeDouble(BaseLot * mults[i], 2);
       LotSeq[i] = MathMax(LotSeq[i], SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN));
+      LotSeq[i] = NormalizeVolume(LotSeq[i]);
    }
 
    // EMA indicators
@@ -143,6 +161,10 @@ int OnInit()
    Print("Base: ", DoubleToString(BaseLot, 2),
          " | Bias lot: ", DoubleToString(biasLot, 2),
          " (×", DoubleToString(BiasMultiplier, 1), ")");
+   if(MaxLotPerPosition > 0.0)
+      Print("MaxLotPerPosition: ", DoubleToString(MaxLotPerPosition, 2),
+            " (caps grid recovery — no 0.09 lots)");
+   Print("Tester: load Inputs from Experts tab; .mq5 defaults are NOT applied if a .set is used.");
    Print("EMA(", EMA_Fast, "/", EMA_Slow, " on ", EnumToString(EMA_TF), ")");
    if(UseSessionFilter)
       Print("Session: ", SessionStart, "-", SessionEnd, " (server hour, end exclusive)");
@@ -309,16 +331,9 @@ void OnTick()
          CheckNextLevel(b, bid, ask);
    }
 
-   // Open new baskets if slots available
-   if(inSession)
-   {
-      int active = CountActive();
-      while(active < MaxBaskets)
-      {
-         if(!TryOpenNewBasket(bid, ask)) break;
-         active++;
-      }
-   }
+   // Open new baskets — at most ONE per tick (while-loop filled all slots in minutes → "Asia only")
+   if(inSession && CountActive() < MaxBaskets)
+      TryOpenNewBasket(bid, ask);
 
    UpdateDashboard();
 }
@@ -330,6 +345,7 @@ bool TryOpenNewBasket(double bid, double ask)
 {
    double biasLot = NormalizeDouble(BaseLot * BiasMultiplier, 2);
    biasLot = MathMax(biasLot, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN));
+   biasLot = NormalizeVolume(biasLot);
 
    if(!HasEnoughMargin(biasLot))
    {
@@ -388,6 +404,9 @@ void OpenBasket(int b, double bid, double ask)
       if(close1 >= close5) { buyLot = biasLot; sellLot = BaseLot; }
       else                 { buyLot = BaseLot; sellLot = biasLot; }
    }
+
+   buyLot  = NormalizeVolume(buyLot);
+   sellLot = NormalizeVolume(sellLot);
 
    int magic = g_baskets[b].magic;
    trade.SetExpertMagicNumber(magic);
@@ -473,7 +492,8 @@ void AddLevel(int b, int recovDir, double bid, double ask)
    int magic = g_baskets[b].magic;
    trade.SetExpertMagicNumber(magic);
 
-   double recLot = (g_baskets[b].recoveryDir == recovDir) ? nextLot : BaseLot;
+   double hedgeLot = NormalizeVolume(BaseLot);
+   double recLot   = (g_baskets[b].recoveryDir == recovDir) ? nextLot : hedgeLot;
    string tag = "HG_B" + IntegerToString(b) + "_L" + IntegerToString(nextLv);
 
    if(recovDir == 0)
@@ -483,7 +503,7 @@ void AddLevel(int b, int recovDir, double bid, double ask)
       g_baskets[b].lastBuyPrice = ask;
       g_baskets[b].posCount++;
 
-      if(trade.Sell(BaseLot, _Symbol, bid, 0, 0, tag + "_SELL"))
+      if(trade.Sell(hedgeLot, _Symbol, bid, 0, 0, tag + "_SELL"))
       { g_baskets[b].lastSellPrice = bid; g_baskets[b].posCount++; }
    }
    else
@@ -493,7 +513,7 @@ void AddLevel(int b, int recovDir, double bid, double ask)
       g_baskets[b].lastSellPrice = bid;
       g_baskets[b].posCount++;
 
-      if(trade.Buy(BaseLot, _Symbol, ask, 0, 0, tag + "_BUY"))
+      if(trade.Buy(hedgeLot, _Symbol, ask, 0, 0, tag + "_BUY"))
       { g_baskets[b].lastBuyPrice = ask; g_baskets[b].posCount++; }
    }
 
@@ -501,7 +521,7 @@ void AddLevel(int b, int recovDir, double bid, double ask)
 
    string dir = recovDir == 0 ? "BUY" : "SELL";
    Print("B#", b, " Lv", nextLv, " ", dir, " rec | ",
-         DoubleToString(recLot, 2), "+", DoubleToString(BaseLot, 2),
+         DoubleToString(recLot, 2), "+", DoubleToString(hedgeLot, 2),
          " | $", DoubleToString(GetBasketPnL(magic), 2));
 }
 
@@ -510,15 +530,8 @@ void AddLevel(int b, int recovDir, double bid, double ask)
 //+------------------------------------------------------------------+
 double GetLot(int level)
 {
-   if(level < 0 || level >= 9) return BaseLot;
-   double lot     = LotSeq[level];
-   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   lot = MathMax(lot, minLot);
-   lot = MathMin(lot, maxLot);
-   lot = MathFloor(lot / lotStep) * lotStep;
-   return NormalizeDouble(lot, 2);
+   if(level < 0 || level >= 9) return NormalizeVolume(BaseLot);
+   return NormalizeVolume(LotSeq[level]);
 }
 
 //+------------------------------------------------------------------+
