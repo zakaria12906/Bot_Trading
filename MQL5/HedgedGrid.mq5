@@ -29,7 +29,7 @@ input int      MaxLevels        = 7;       // Grid depth (lots up to 0.11)
 
 // ── Grid spacing ──
 input double   GridStep         = 2.5;     // Points between grid levels
-input double   MinDistance      = 2.0;     // Min points between basket entries
+input double   MinDistance      = 1.2;     // Min points between basket entries (lower = more entries)
 
 // ── Take profit ──
 input double   BasketTP         = 3.0;     // Close basket when net P/L >= this ($)
@@ -43,9 +43,10 @@ input int      EMA_Fast         = 8;       // Fast EMA period
 input int      EMA_Slow         = 21;      // Slow EMA period
 input ENUM_TIMEFRAMES EMA_TF   = PERIOD_M5;  // M5 for faster reaction
 
-// ── Session ──
-input int      SessionStart     = 1;       // Start hour (server time)
-input int      SessionEnd       = 23;      // End hour (server time)
+// ── Session (broker / tester server time) ──
+input bool     UseSessionFilter = false;   // false = 24h (London+NY+Asia)
+input int      SessionStart     = 0;       // First hour IN session (0-23)
+input int      SessionEnd       = 24;      // End: hour < SessionEnd (use 24 for full day 0-23)
 
 // ── Risk ──
 input double   MaxDrawdown      = 120.0;   // Emergency close ONE basket ($)
@@ -143,6 +144,10 @@ int OnInit()
          " | Bias lot: ", DoubleToString(biasLot, 2),
          " (×", DoubleToString(BiasMultiplier, 1), ")");
    Print("EMA(", EMA_Fast, "/", EMA_Slow, " on ", EnumToString(EMA_TF), ")");
+   if(UseSessionFilter)
+      Print("Session: ", SessionStart, "-", SessionEnd, " (server hour, end exclusive)");
+   else
+      Print("Session: 24h (London + NY + Asia)");
    Print("Recovery lots: [", lots, "] | Levels: ", MaxLevels);
    Print("DD: $", MaxDrawdown, "/basket | $", MaxTotalDrawdown, "/total");
 
@@ -183,14 +188,33 @@ int DetectTrend()
    // Current: fast vs slow
    double diff = fast[1] - slow[1];
    // Trend strength: how fast the EMA gap is changing
-   double prevDiff = fast[0] - slow[0];
-   double momentum = diff - prevDiff;
+   // Fast vs slow only — works in volatile sessions (London/NY); neutral uses M1 tiebreaker in OpenBasket
+   if(diff > 0) return 0;   // BUY bias
+   if(diff < 0) return 1;   // SELL bias
+   return -1;               // flat EMAs (rare)
+}
 
-   // Require both crossover AND momentum confirmation
-   if(diff > 0 && momentum >= 0) return 0;  // BUY trend
-   if(diff < 0 && momentum <= 0) return 1;  // SELL trend
+//+------------------------------------------------------------------+
+//| Session filter — broker/tester server time (chart time)           |
+//+------------------------------------------------------------------+
+bool IsInSession(const MqlDateTime &dt)
+{
+   if(!UseSessionFilter)
+      return true;
 
-   return -1;  // neutral / conflicting
+   int h = dt.hour;
+   int s0 = SessionStart;
+   int s1 = SessionEnd;
+   if(s0 < 0) s0 = 0;
+   if(s1 > 24) s1 = 24;
+
+   if(s0 == 0 && s1 >= 24)
+      return true;
+
+   if(s0 < s1)
+      return (h >= s0 && h < s1);
+
+   return (h >= s0 || h < s1);
 }
 
 //+------------------------------------------------------------------+
@@ -220,7 +244,7 @@ void OnTick()
 {
    MqlDateTime dt;
    TimeCurrent(dt);
-   bool inSession = (dt.hour >= SessionStart && dt.hour < SessionEnd);
+   bool inSession = IsInSession(dt);
 
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
